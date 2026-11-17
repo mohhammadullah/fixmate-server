@@ -3,7 +3,7 @@ import type { Response } from "express";
 import { ObjectId, type Filter, type Sort } from "mongodb";
 import { getDB } from "../config/db.js";
 import type { AuthenticatedRequest } from "../middleware/verifyToken.js";
-import { createBookingSchema, listTechnicianBookingsQuerySchema, OBJECT_ID_HEX_REGEX } from "../validators/booking.validator.js";
+import { createBookingSchema, listTechnicianBookingsQuerySchema, updateBookingStatusSchema, OBJECT_ID_HEX_REGEX } from "../validators/booking.validator.js";
 import {
   getBookingsCollection,
   ACTIVE_BOOKING_STATUSES,
@@ -427,4 +427,96 @@ export const rejectBooking = async (
     "rejected",
     "Booking rejected successfully."
   );
+};
+
+// Maps the target status to the expected source status. Only these two
+// forward transitions exist; everything else is a 409.
+const STATUS_TRANSITIONS = {
+  "in-progress": { from: "accepted", message: "Booking marked as in-progress." },
+  completed: { from: "in-progress", message: "Booking completed successfully." },
+} as const;
+
+// PATCH /api/bookings/:id/status — technician only (verifyToken -> verifyTechnician).
+// Moves an accepted booking to in-progress, or an in-progress booking to
+// completed (with finalAmount). finalAmount is the technician's final repair
+// charge at this stage — it is not a payment and triggers no payment flow.
+// Ownership and the expected source status are enforced atomically by the
+// {_id, technicianId, status: <from>} filter; the post-failure lookup only
+// distinguishes 404 from 409 and never authorizes a write.
+export const updateBookingStatus = async (
+  req: AuthenticatedRequest,
+  res: Response
+): Promise<void> => {
+  if (!req.user) {
+    res.status(401).json({
+      success: false,
+      message: "Authentication token is required.",
+    });
+    return;
+  }
+
+  const technicianId = resolveTechnicianId(req);
+
+  if (!technicianId) {
+    res.status(401).json({
+      success: false,
+      message: "Invalid token payload.",
+    });
+    return;
+  }
+
+  const { id } = req.params;
+  const bookingId = parseParamId(id);
+
+  if (!bookingId) {
+    res.status(400).json({
+      success: false,
+      message: "Invalid booking id.",
+    });
+    return;
+  }
+
+  const parsed = updateBookingStatusSchema.safeParse(req.body);
+
+  if (!parsed.success) {
+    res.status(400).json({
+      success: false,
+      message: "Validation failed.",
+      errors: parsed.error.issues.map((issue) => ({
+        field: issue.path.join("."),
+        message: issue.message,
+      })),
+    });
+    return;
+  }
+
+  const transition = STATUS_TRANSITIONS[parsed.data.status];
+
+  const updatePayload: Partial<Pick<Booking, "status" | "finalAmount" | "updatedAt">> = {
+    status: parsed.data.status,
+    updatedAt: new Date(),
+  };
+
+  if (parsed.data.status === "completed") {
+    updatePayload.finalAmount = parsed.data.finalAmount;
+  }
+
+  // MongoDB errors propagate to Express 5, which forwards them to the
+  // existing errorHandler middleware.
+  const updated = await getBookingsCollection().findOneAndUpdate(
+    { _id: bookingId, technicianId, status: transition.from },
+    { $set: updatePayload },
+    { returnDocument: "after" }
+  );
+
+  if (!updated) {
+    await respondAfterFailedTransition(res, bookingId, technicianId);
+    return;
+  }
+
+  res.status(200).json({
+    success: true,
+    message: transition.message,
+    data: updated,
+  });
 };

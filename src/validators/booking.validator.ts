@@ -60,5 +60,30 @@ export const listTechnicianBookingsQuerySchema = z.object({
   limit: positiveIntQuerySchema("limit", 50),
 });
 
+// Technician status-workflow transitions. Two allowed shapes only:
+//   { "status": "in-progress" }
+//   { "status": "completed", "finalAmount": <finite positive number> }
+// Ownership/workflow/settlement fields are server-controlled and deliberately
+// absent: both arms are strict objects, so unexpected keys (technicianId,
+// customerId, paymentStatus, finalAmount-on-in-progress, timestamps, …) are
+// rejected. `finalAmount` is the technician's final repair charge at this
+// stage — it is NOT a payment.
+export const updateBookingStatusSchema = z.discriminatedUnion("status", [
+  z.strictObject({
+    status: z.literal("in-progress"),
+  }),
+  z.strictObject({
+    status: z.literal("completed"),
+    finalAmount: z
+      .number({
+        error: "finalAmount is required and must be a number when completing a booking",
+      })
+      .finite("finalAmount must be a finite number")
+      .positive("finalAmount must be greater than 0"),
+  }),
+]);
+
 export type ListTechnicianBookingsQueryInput = z.input<typeof listTechnicianBookingsQuerySchema>;
 export type ListTechnicianBookingsQueryData = z.infer<typeof listTechnicianBookingsQuerySchema>;
+export type UpdateBookingStatusInput = z.input<typeof updateBookingStatusSchema>;
+export type UpdateBookingStatusData = z.infer<typeof updateBookingStatusSchema>;
