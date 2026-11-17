@@ -313,6 +313,50 @@ export const deleteService = async (
   });
 };
 
+// GET /api/services/:id — public service details.
+//
+// Strict 24-char hex ObjectId validation (ObjectId.isValid also accepts
+// 12-byte strings). Only approved + available services are visible, using
+// the exact same safe projection as the public listing; unapproved,
+// unavailable and missing services are all indistinguishable 404s.
+export const getServiceDetails = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  const { id } = req.params;
+  const raw = Array.isArray(id) ? id[0] : id;
+
+  if (typeof raw !== "string" || !OBJECT_ID_HEX_REGEX.test(raw)) {
+    res.status(400).json({
+      success: false,
+      message: "Invalid service id.",
+    });
+    return;
+  }
+
+  const service = await getServicesCollection().findOne(
+    {
+      _id: new ObjectId(raw),
+      approvalStatus: "approved",
+      availabilityStatus: "available",
+    },
+    { projection: PUBLIC_PROJECTION }
+  );
+
+  if (!service) {
+    res.status(404).json({
+      success: false,
+      message: "Service not found.",
+    });
+    return;
+  }
+
+  res.status(200).json({
+    success: true,
+    data: service,
+  });
+};
+
 // Admin moderation endpoints (verifyToken -> verifyAdmin).
 //
 // Race-condition safety: the pending-only transition is enforced by the
