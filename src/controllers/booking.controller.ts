@@ -63,6 +63,60 @@ const resolveTechnicianId = resolveAuthUserId;
 
 const BOOKING_SORT: Sort = { createdAt: -1, _id: -1 };
 
+// Safe DTO for the customer-owned booking-details endpoint. Contains only
+// what a Booking Details page needs; internal MongoDB fields (_id,
+// customerId, serviceId, securityDeposit) and sensitive account data
+// (customerName/customerEmail, technicianEmail) are deliberately excluded.
+interface BookingDetailsDTO {
+  id: string;
+  service: {
+    title: string;
+    category: Booking["serviceCategory"];
+    location: string;
+    image: string;
+    hourlyRate: number;
+  };
+  technician: {
+    id: string;
+    name: string;
+  };
+  problemDescription: string;
+  status: Booking["status"];
+  paymentStatus: Booking["paymentStatus"];
+  // Settled only when the job is completed; omitted until then.
+  finalAmount?: number;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const toBookingDetailsDTO = (booking: Booking): BookingDetailsDTO => {
+  const dto: BookingDetailsDTO = {
+    id: booking._id.toHexString(),
+    service: {
+      title: booking.serviceTitle,
+      category: booking.serviceCategory,
+      location: booking.serviceLocation,
+      image: booking.serviceImage,
+      hourlyRate: booking.hourlyRate,
+    },
+    technician: {
+      id: booking.technicianId.toHexString(),
+      name: booking.technicianName,
+    },
+    problemDescription: booking.problemDescription,
+    status: booking.status,
+    paymentStatus: booking.paymentStatus,
+    createdAt: booking.createdAt,
+    updatedAt: booking.updatedAt,
+  };
+
+  if (booking.finalAmount !== undefined) {
+    dto.finalAmount = booking.finalAmount;
+  }
+
+  return dto;
+};
+
 // POST /api/bookings — customer only (verifyToken -> verifyCustomer).
 // Identity is taken exclusively from the verified JWT and the server-side
 // user document; client-supplied ownership/status/payment fields are
@@ -682,5 +736,65 @@ export const cancelBooking = async (
     success: true,
     message: "Booking cancelled successfully.",
     data: updated,
+  });
+};
+
+// GET /api/bookings/:id — customer only (verifyToken -> verifyCustomer).
+// Returns the safe Booking Details DTO for the authenticated customer's
+// own booking only: the {_id, customerId} filter makes another customer's
+// booking indistinguishable from a missing one (404 either way). Identity
+// comes exclusively from the verified JWT; any customerId in the query
+// string or body is ignored (this handler never reads either).
+export const getBookingDetails = async (
+  req: AuthenticatedRequest,
+  res: Response
+): Promise<void> => {
+  if (!req.user) {
+    res.status(401).json({
+      success: false,
+      message: "Authentication token is required.",
+    });
+    return;
+  }
+
+  const customerId = resolveAuthUserId(req);
+
+  if (!customerId) {
+    res.status(401).json({
+      success: false,
+      message: "Invalid token payload.",
+    });
+    return;
+  }
+
+  const { id } = req.params;
+  const bookingId = parseParamId(id);
+
+  if (!bookingId) {
+    res.status(400).json({
+      success: false,
+      message: "Invalid booking id.",
+    });
+    return;
+  }
+
+  // MongoDB errors propagate to Express 5, which forwards them to the
+  // existing errorHandler middleware.
+  const booking = await getBookingsCollection().findOne({
+    _id: bookingId,
+    customerId,
+  });
+
+  if (!booking) {
+    res.status(404).json({
+      success: false,
+      message: "Booking not found.",
+    });
+    return;
+  }
+
+  res.status(200).json({
+    success: true,
+    data: toBookingDetailsDTO(booking),
   });
 };

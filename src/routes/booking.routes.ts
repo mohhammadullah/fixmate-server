@@ -2,7 +2,7 @@
 import { Router } from "express";
 import { verifyToken } from "../middleware/verifyToken.js";
 import { verifyCustomer } from "../middleware/verifyCustomer.js";
-import { createBooking, listTechnicianBookings, acceptBooking, rejectBooking, updateBookingStatus, listMyBookings, cancelBooking } from "../controllers/booking.controller.js";
+import { createBooking, listTechnicianBookings, acceptBooking, rejectBooking, updateBookingStatus, listMyBookings, cancelBooking, getBookingDetails } from "../controllers/booking.controller.js";
 import { verifyTechnician } from "../middleware/verifyTechnician.js";
 
 const router = Router();
@@ -15,5 +15,8 @@ router.patch("/:id/accept", verifyToken, verifyTechnician, acceptBooking);
 router.patch("/:id/reject", verifyToken, verifyTechnician, rejectBooking);
 router.patch("/:id/status", verifyToken, verifyTechnician, updateBookingStatus);
 router.patch("/:id/cancel", verifyToken, verifyCustomer, cancelBooking);
+// Registered after the static GET routes (/my, /technician) so it never
+// shadows them.
+router.get("/:id", verifyToken, verifyCustomer, getBookingDetails);
 
 export default router;
