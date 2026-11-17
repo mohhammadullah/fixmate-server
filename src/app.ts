@@ -6,6 +6,7 @@ import { rateLimit } from "express-rate-limit";
 import { toNodeHandler } from "better-auth/node";
 
 import testRoutes from "./routes/test.routes.js";
+import serviceRoutes from "./routes/service.routes.js";
 import { errorHandler, notFoundHandler } from "./middleware/errorHandler.js";
 import { env } from "./config/env.js";
 import type { Auth } from "./config/auth.js";
@@ -62,6 +63,7 @@ export const createApp = (auth: Auth) => {
   });
 
   app.use("/api/test", testRoutes);
+  app.use("/api/services", serviceRoutes);
 
   app.use(notFoundHandler);
   app.use(errorHandler);
