@@ -3,7 +3,7 @@ import type { Response } from "express";
 import { ObjectId } from "mongodb";
 import { getDB } from "../config/db.js";
 import type { AuthenticatedRequest } from "../middleware/verifyToken.js";
-import { createServiceSchema, updateServiceSchema } from "../validators/service.validator.js";
+import { createServiceSchema, updateServiceSchema, rejectServiceSchema } from "../validators/service.validator.js";
 import {
   getServicesCollection,
   type Service,
@@ -164,6 +164,20 @@ const parseServiceId = (raw: unknown): ObjectId | null => {
   return new ObjectId(id);
 };
 
+// Admin moderation endpoints require a strict 24-character hex ObjectId:
+// ObjectId.isValid would also accept 12-byte strings, so check explicitly.
+const OBJECT_ID_HEX_REGEX = /^[0-9a-fA-F]{24}$/;
+
+const parseAdminServiceId = (raw: unknown): ObjectId | null => {
+  const id = Array.isArray(raw) ? raw[0] : raw;
+
+  if (typeof id !== "string" || !OBJECT_ID_HEX_REGEX.test(id)) {
+    return null;
+  }
+
+  return new ObjectId(id);
+};
+
 // PATCH /api/services/:id — technician only (verifyToken -> verifyTechnician).
 // Ownership is enforced by the {_id, technicianId} filter, so one technician
 // can never edit another's service (404 either way, indistinguishable).
@@ -296,6 +310,157 @@ export const deleteService = async (
   res.status(200).json({
     success: true,
     message: "Service deleted successfully.",
+  });
+};
+
+// Admin moderation endpoints (verifyToken -> verifyAdmin).
+//
+// Race-condition safety: the pending-only transition is enforced by the
+// atomic {_id, approvalStatus: "pending"} filter passed to findOneAndUpdate,
+// never by a prior read. Two concurrent admin decisions therefore cannot
+// both win — the loser matches nothing and is reported as 409 (or 404 if
+// the document vanished in between). The second lookup below runs only
+// after a failed atomic update and exists purely to distinguish those two
+// cases; it never authorizes a write.
+
+const respondAfterFailedTransition = async (
+  res: Response,
+  serviceId: ObjectId
+): Promise<void> => {
+  const existing = await getServicesCollection().findOne(
+    { _id: serviceId },
+    { projection: { _id: 1 } }
+  );
+
+  if (!existing) {
+    res.status(404).json({
+      success: false,
+      message: "Service not found.",
+    });
+    return;
+  }
+
+  res.status(409).json({
+    success: false,
+    message: "Service has already been approved or rejected.",
+  });
+};
+
+// PATCH /api/services/:id/approve — admin only (verifyToken -> verifyAdmin).
+// Approval identity is never taken from the request; the token only
+// authorizes the caller. All other document fields are preserved.
+export const approveService = async (
+  req: AuthenticatedRequest,
+  res: Response
+): Promise<void> => {
+  if (!req.user) {
+    res.status(401).json({
+      success: false,
+      message: "Authentication token is required.",
+    });
+    return;
+  }
+
+  const { id } = req.params;
+  const serviceId = parseAdminServiceId(id);
+
+  if (!serviceId) {
+    res.status(400).json({
+      success: false,
+      message: "Invalid service id.",
+    });
+    return;
+  }
+
+  const now = new Date();
+
+  // MongoDB errors propagate to Express 5, which forwards them to the
+  // existing errorHandler middleware.
+  const updated = await getServicesCollection().findOneAndUpdate(
+    { _id: serviceId, approvalStatus: "pending" },
+    {
+      $set: { approvalStatus: "approved", updatedAt: now },
+      $unset: { rejectionReason: "" },
+    },
+    { returnDocument: "after" }
+  );
+
+  if (!updated) {
+    await respondAfterFailedTransition(res, serviceId);
+    return;
+  }
+
+  res.status(200).json({
+    success: true,
+    message: "Service approved successfully.",
+    data: updated,
+  });
+};
+
+// PATCH /api/services/:id/reject — admin only (verifyToken -> verifyAdmin).
+// The only client-supplied value is rejectionReason, validated and trimmed
+// by rejectServiceSchema; everything server-controlled is rejected by the
+// strict object shape. All other document fields are preserved.
+export const rejectService = async (
+  req: AuthenticatedRequest,
+  res: Response
+): Promise<void> => {
+  if (!req.user) {
+    res.status(401).json({
+      success: false,
+      message: "Authentication token is required.",
+    });
+    return;
+  }
+
+  const { id } = req.params;
+  const serviceId = parseAdminServiceId(id);
+
+  if (!serviceId) {
+    res.status(400).json({
+      success: false,
+      message: "Invalid service id.",
+    });
+    return;
+  }
+
+  const parsed = rejectServiceSchema.safeParse(req.body);
+
+  if (!parsed.success) {
+    res.status(400).json({
+      success: false,
+      message: "Validation failed.",
+      errors: parsed.error.issues.map((issue) => ({
+        field: issue.path.join("."),
+        message: issue.message,
+      })),
+    });
+    return;
+  }
+
+  // MongoDB errors propagate to Express 5, which forwards them to the
+  // existing errorHandler middleware.
+  const updated = await getServicesCollection().findOneAndUpdate(
+    { _id: serviceId, approvalStatus: "pending" },
+    {
+      $set: {
+        approvalStatus: "rejected",
+        rejectionReason: parsed.data.rejectionReason,
+        updatedAt: new Date(),
+      },
+    },
+    { returnDocument: "after" }
+  );
+
+  if (!updated) {
+    await respondAfterFailedTransition(res, serviceId);
+    return;
+  }
+
+  res.status(200).json({
+    success: true,
+    message: "Service rejected successfully.",
+    data: updated,
   });
 };
 

@@ -97,7 +97,20 @@ export const updateServiceSchema = z
     message: "Provide at least one field to update",
   });
 
+// Admin rejection payload. Server-controlled fields (approvalStatus,
+// technicianId, _id, createdAt, updatedAt, …) are deliberately absent:
+// z.strictObject rejects any key outside this shape.
+export const rejectServiceSchema = z.strictObject({
+  rejectionReason: z
+    .string({ error: "Rejection reason is required and must be a string" })
+    .trim()
+    .min(1, "Rejection reason cannot be empty")
+    .max(500, "Rejection reason must be at most 500 characters long"),
+});
+
 export type CreateServiceInput = z.input<typeof createServiceSchema>;
 export type UpdateServiceInput = z.input<typeof updateServiceSchema>;
+export type RejectServiceInput = z.input<typeof rejectServiceSchema>;
 export type CreateServiceData = z.infer<typeof createServiceSchema>;
 export type UpdateServiceData = z.infer<typeof updateServiceSchema>;
+export type RejectServiceData = z.infer<typeof rejectServiceSchema>;
