@@ -1,9 +1,9 @@
 
-import type { Response } from "express";
-import { ObjectId } from "mongodb";
+import type { Request, Response } from "express";
+import { ObjectId, type Filter, type Sort } from "mongodb";
 import { getDB } from "../config/db.js";
 import type { AuthenticatedRequest } from "../middleware/verifyToken.js";
-import { createServiceSchema, updateServiceSchema, rejectServiceSchema } from "../validators/service.validator.js";
+import { createServiceSchema, updateServiceSchema, rejectServiceSchema, listServicesQuerySchema, escapeRegExp, type ListServicesSort } from "../validators/service.validator.js";
 import {
   getServicesCollection,
   type Service,
@@ -343,6 +343,122 @@ const respondAfterFailedTransition = async (
   res.status(409).json({
     success: false,
     message: "Service has already been approved or rejected.",
+  });
+};
+
+// GET /api/services — public, no authentication.
+//
+// Only approved + available services are returned. Internal-only fields
+// (rejectionReason, technicianEmail, technicianId) are stripped by the
+// projection; everything else is a public service field. All query input is
+// validated by listServicesQuerySchema, regex input is escaped, and the
+// filter is a typed MongoDB Filter built exclusively from validated values —
+// raw query parameters can never reach the query engine.
+
+// Documents returned by the public listing: everything on Service except the
+// internal-only fields removed by the projection below.
+type PublicService = Omit<
+  Service,
+  "technicianId" | "technicianEmail" | "rejectionReason"
+>;
+
+const PUBLIC_PROJECTION = {
+  rejectionReason: 0,
+  technicianEmail: 0,
+  technicianId: 0,
+} as const;
+
+const resolvePublicSort = (sort: ListServicesSort): Sort => {
+  switch (sort) {
+    case "price_asc":
+      // _id tie-breaker keeps pagination deterministic.
+      return { hourlyRate: 1, _id: 1 };
+    case "price_desc":
+      return { hourlyRate: -1, _id: -1 };
+    case "newest":
+      return { createdAt: -1, _id: -1 };
+  }
+};
+
+export const listServices = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  const parsed = listServicesQuerySchema.safeParse(req.query);
+
+  if (!parsed.success) {
+    res.status(400).json({
+      success: false,
+      message: "Validation failed.",
+      errors: parsed.error.issues.map((issue) => ({
+        field: issue.path.join("."),
+        message: issue.message,
+      })),
+    });
+    return;
+  }
+
+  const { search, category, location, minPrice, maxPrice, sort } = parsed.data;
+  const page = parsed.data.page ?? 1;
+  // Chosen behavior: limit above 50 is rejected by the schema with 400.
+  const limit = parsed.data.limit ?? 12;
+
+  const filter: Filter<Service> = {
+    approvalStatus: "approved",
+    availabilityStatus: "available",
+  };
+
+  if (search) {
+    const pattern = { $regex: escapeRegExp(search), $options: "i" as const };
+    filter.$or = [
+      { title: pattern },
+      { description: pattern },
+      { overview: pattern },
+      { location: pattern },
+      { category: pattern },
+    ];
+  }
+
+  if (category) {
+    filter.category = category;
+  }
+
+  if (location) {
+    filter.location = { $regex: escapeRegExp(location), $options: "i" };
+  }
+
+  if (minPrice !== undefined || maxPrice !== undefined) {
+    filter.hourlyRate = {
+      ...(minPrice !== undefined ? { $gte: minPrice } : {}),
+      ...(maxPrice !== undefined ? { $lte: maxPrice } : {}),
+    };
+  }
+
+  // MongoDB errors propagate to Express 5, which forwards them to the
+  // existing errorHandler middleware (no internals exposed).
+  const [items, totalItems] = await Promise.all([
+    getServicesCollection()
+      .find(filter, { projection: PUBLIC_PROJECTION })
+      .sort(resolvePublicSort(sort))
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .toArray() as Promise<PublicService[]>,
+    getServicesCollection().countDocuments(filter),
+  ]);
+
+  const totalPages = totalItems === 0 ? 0 : Math.ceil(totalItems / limit);
+
+  res.status(200).json({
+    success: true,
+    data: items,
+    pagination: {
+      currentPage: page,
+      limit,
+      totalItems,
+      totalPages,
+      hasNextPage: page < totalPages,
+      hasPrevPage: page > 1,
+    },
   });
 };
 

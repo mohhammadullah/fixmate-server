@@ -3,9 +3,12 @@ import { Router } from "express";
 import { verifyToken } from "../middleware/verifyToken.js";
 import { verifyTechnician } from "../middleware/verifyTechnician.js";
 import { verifyAdmin } from "../middleware/verifyAdmin.js";
-import { createService, updateService, deleteService, approveService, rejectService } from "../controllers/service.controller.js";
+import { createService, updateService, deleteService, approveService, rejectService, listServices } from "../controllers/service.controller.js";
 
 const router = Router();
+
+// GET / is intentionally public: only approved + available services are exposed.
+router.get("/", listServices);
 
 // Middleware order matters: JWT first, then role. Never trust body roles.
 router.post("/", verifyToken, verifyTechnician, createService);

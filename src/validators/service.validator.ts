@@ -3,6 +3,12 @@ import { z } from "zod";
 import { SERVICE_CATEGORIES } from "../models/service.model.js";
 
 // Shared field schemas. Strings are trimmed before length checks.
+const QUERY_STRING_MAX = 200;
+
+// Escapes every regex metacharacter so user input is always matched
+// literally. Used for both the `search` term and the `location` filter.
+export const escapeRegExp = (value: string): string =>
+  value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const titleSchema = z
   .string({ error: "Title is required and must be a string" })
   .trim()
@@ -97,6 +103,83 @@ export const updateServiceSchema = z
     message: "Provide at least one field to update",
   });
 
+// Public listing query. Unknown query keys are stripped (not rejected) —
+// browsers may send extra parameters. Empty strings for `search`/`location`
+// are treated as absent. Everything else is validated strictly.
+
+const optionalTrimmedQuery = z
+  .string({ error: "Must be a string" })
+  .trim()
+  .max(QUERY_STRING_MAX, `Must be at most ${QUERY_STRING_MAX} characters long`)
+  .transform((value) => (value.length === 0 ? undefined : value))
+  .optional();
+
+const priceQuerySchema = (label: string) =>
+  z
+    .string({ error: `${label} must be a string` })
+    .trim()
+    .refine((value) => value.length > 0, `${label} cannot be empty`)
+    .refine(
+      (value) => Number.isFinite(Number(value)),
+      `${label} must be a finite number`
+    )
+    .transform(Number)
+    .pipe(z.number().finite().nonnegative(`${label} cannot be negative`))
+    .optional();
+
+const positiveIntQuerySchema = (label: string, max?: number) => {
+  const base = z
+    .string({ error: `${label} must be a string` })
+    .trim()
+    .refine(
+      (value) => /^[1-9]\d*$/.test(value),
+      `${label} must be a positive integer`
+    )
+    .transform(Number)
+    .pipe(z.number().int().min(1, `${label} must be at least 1`));
+
+  return (max === undefined ? base : base.pipe(z.number().int().max(max, `${label} must be at most ${max}`))).optional();
+};
+
+export const LIST_SERVICES_SORTS = ["newest", "price_asc", "price_desc"] as const;
+export type ListServicesSort = (typeof LIST_SERVICES_SORTS)[number];
+
+export const listServicesQuerySchema = z
+  .object({
+    search: optionalTrimmedQuery,
+    category: z
+      .string({ error: "Category must be a string" })
+      .trim()
+      .pipe(
+        z.enum(SERVICE_CATEGORIES, {
+          error: `Category must be one of the supported categories: ${SERVICE_CATEGORIES.join(", ")}`,
+        })
+      )
+      .optional(),
+    location: optionalTrimmedQuery,
+    minPrice: priceQuerySchema("minPrice"),
+    maxPrice: priceQuerySchema("maxPrice"),
+    sort: z
+      .enum(LIST_SERVICES_SORTS, {
+        error: `Sort must be one of: ${LIST_SERVICES_SORTS.join(", ")}`,
+      })
+      .default("newest"),
+    page: positiveIntQuerySchema("page"),
+    // Chosen behavior: a limit above 50 is rejected with HTTP 400 rather
+    // than silently capped.
+    limit: positiveIntQuerySchema("limit", 50),
+  })
+  .refine(
+    (data) =>
+      data.minPrice === undefined ||
+      data.maxPrice === undefined ||
+      data.minPrice <= data.maxPrice,
+    {
+      message: "minPrice must not exceed maxPrice",
+      path: ["minPrice"],
+    }
+  );
+
 // Admin rejection payload. Server-controlled fields (approvalStatus,
 // technicianId, _id, createdAt, updatedAt, …) are deliberately absent:
 // z.strictObject rejects any key outside this shape.
@@ -114,3 +197,5 @@ export type RejectServiceInput = z.input<typeof rejectServiceSchema>;
 export type CreateServiceData = z.infer<typeof createServiceSchema>;
 export type UpdateServiceData = z.infer<typeof updateServiceSchema>;
 export type RejectServiceData = z.infer<typeof rejectServiceSchema>;
+export type ListServicesQueryInput = z.input<typeof listServicesQuerySchema>;
+export type ListServicesQueryData = z.infer<typeof listServicesQuerySchema>;
