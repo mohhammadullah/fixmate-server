@@ -3,7 +3,7 @@ import type { Request, Response } from "express";
 import { ObjectId, type Filter, type Sort } from "mongodb";
 import { getDB } from "../config/db.js";
 import type { AuthenticatedRequest } from "../middleware/verifyToken.js";
-import { createServiceSchema, updateServiceSchema, rejectServiceSchema, listServicesQuerySchema, escapeRegExp, type ListServicesSort } from "../validators/service.validator.js";
+import { createServiceSchema, updateServiceSchema, rejectServiceSchema, listServicesQuerySchema, listMyServicesQuerySchema, escapeRegExp, type ListServicesSort } from "../validators/service.validator.js";
 import {
   getServicesCollection,
   type Service,
@@ -380,6 +380,45 @@ const resolvePublicSort = (sort: ListServicesSort): Sort => {
   }
 };
 
+// Safe DTO for the technician "my services" dashboard. Contains only what
+// the dashboard needs; internal MongoDB fields (_id, technicianId,
+// availabilityStatus), account data (technicianName/technicianEmail), the
+// raw description and admin-only fields (rejectionReason) are deliberately
+// excluded. `isAvailable` mirrors availabilityStatus.
+interface MyServiceDTO {
+  id: string;
+  title: string;
+  category: Service["category"];
+  location: string;
+  image: string;
+  hourlyRate: number;
+  securityDeposit: number;
+  maxCapacity: number;
+  amenities: string[];
+  overview: string;
+  approvalStatus: ServiceApprovalStatus;
+  isAvailable: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const toMyServiceDTO = (service: Service): MyServiceDTO => ({
+  id: service._id.toHexString(),
+  title: service.title,
+  category: service.category,
+  location: service.location,
+  image: service.image,
+  hourlyRate: service.hourlyRate,
+  securityDeposit: service.securityDeposit,
+  maxCapacity: service.maxCapacity,
+  amenities: service.amenities,
+  overview: service.overview,
+  approvalStatus: service.approvalStatus,
+  isAvailable: service.availabilityStatus === "available",
+  createdAt: service.createdAt,
+  updatedAt: service.updatedAt,
+});
+
 export const listServices = async (
   req: Request,
   res: Response
@@ -577,6 +616,95 @@ export const rejectService = async (
     success: true,
     message: "Service rejected successfully.",
     data: updated,
+  });
+};
+
+const MY_SERVICES_SORT: Sort = { createdAt: -1, _id: -1 };
+
+// GET /api/services/my — technician only (verifyToken -> verifyTechnician).
+// Returns only services whose technicianId matches the verified JWT; any
+// technicianId in the query string is stripped by the schema and ignored.
+// Sorted newest first; pagination metadata matches the booking list
+// endpoints. Unlike the public listing this returns every approval status
+// (pending/approved/rejected) unless `approvalStatus`/`isAvailable` narrow
+// the result set.
+export const listMyServices = async (
+  req: AuthenticatedRequest,
+  res: Response
+): Promise<void> => {
+  if (!req.user) {
+    res.status(401).json({
+      success: false,
+      message: "Authentication token is required.",
+    });
+    return;
+  }
+
+  const technicianId = resolveTechnicianId(req);
+
+  if (!technicianId) {
+    res.status(401).json({
+      success: false,
+      message: "Invalid token payload.",
+    });
+    return;
+  }
+
+  const parsed = listMyServicesQuerySchema.safeParse(req.query);
+
+  if (!parsed.success) {
+    res.status(400).json({
+      success: false,
+      message: "Validation failed.",
+      errors: parsed.error.issues.map((issue) => ({
+        field: issue.path.join("."),
+        message: issue.message,
+      })),
+    });
+    return;
+  }
+
+  const { approvalStatus, isAvailable } = parsed.data;
+  const page = parsed.data.page ?? 1;
+  // Chosen behavior (consistent with the booking list endpoints): limit
+  // defaults to 10 here and a limit above 50 is rejected with HTTP 400.
+  const limit = parsed.data.limit ?? 10;
+
+  const filter: Filter<Service> = { technicianId };
+
+  if (approvalStatus) {
+    filter.approvalStatus = approvalStatus;
+  }
+
+  if (isAvailable !== undefined) {
+    filter.availabilityStatus = isAvailable ? "available" : "unavailable";
+  }
+
+  // MongoDB errors propagate to Express 5, which forwards them to the
+  // existing errorHandler middleware.
+  const [items, totalItems] = await Promise.all([
+    getServicesCollection()
+      .find(filter)
+      .sort(MY_SERVICES_SORT)
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .toArray(),
+    getServicesCollection().countDocuments(filter),
+  ]);
+
+  const totalPages = totalItems === 0 ? 0 : Math.ceil(totalItems / limit);
+
+  res.status(200).json({
+    success: true,
+    data: items.map(toMyServiceDTO),
+    pagination: {
+      currentPage: page,
+      limit,
+      totalItems,
+      totalPages,
+      hasNextPage: page < totalPages,
+      hasPrevPage: page > 1,
+    },
   });
 };
 

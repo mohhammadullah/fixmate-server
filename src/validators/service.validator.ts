@@ -1,6 +1,6 @@
 
 import { z } from "zod";
-import { SERVICE_CATEGORIES } from "../models/service.model.js";
+import { SERVICE_CATEGORIES, SERVICE_APPROVAL_STATUSES } from "../models/service.model.js";
 
 // Shared field schemas. Strings are trimmed before length checks.
 const QUERY_STRING_MAX = 200;
@@ -180,6 +180,30 @@ export const listServicesQuerySchema = z
     }
   );
 
+// Technician "my services" query (GET /api/services/my). Unknown query
+// keys (including any technicianId) are stripped — never trusted; identity
+// comes exclusively from the verified JWT. Everything else is validated
+// strictly and invalid values are rejected with HTTP 400.
+// `isAvailable` mirrors the stored availabilityStatus:
+// "true" -> available, "false" -> unavailable.
+export const listMyServicesQuerySchema = z.object({
+  approvalStatus: z
+    .enum(SERVICE_APPROVAL_STATUSES, {
+      error: `approvalStatus must be one of: ${SERVICE_APPROVAL_STATUSES.join(", ")}`,
+    })
+    .optional(),
+  isAvailable: z
+    .enum(["true", "false"], {
+      error: 'isAvailable must be either "true" or "false"',
+    })
+    .transform((value) => value === "true")
+    .optional(),
+  page: positiveIntQuerySchema("page"),
+  // Chosen behavior (consistent with the other list endpoints): a limit
+  // above 50 is rejected with HTTP 400 rather than silently capped.
+  limit: positiveIntQuerySchema("limit", 50),
+});
+
 // Admin rejection payload. Server-controlled fields (approvalStatus,
 // technicianId, _id, createdAt, updatedAt, …) are deliberately absent:
 // z.strictObject rejects any key outside this shape.
@@ -199,3 +223,5 @@ export type UpdateServiceData = z.infer<typeof updateServiceSchema>;
 export type RejectServiceData = z.infer<typeof rejectServiceSchema>;
 export type ListServicesQueryInput = z.input<typeof listServicesQuerySchema>;
 export type ListServicesQueryData = z.infer<typeof listServicesQuerySchema>;
+export type ListMyServicesQueryInput = z.input<typeof listMyServicesQuerySchema>;
+export type ListMyServicesQueryData = z.infer<typeof listMyServicesQuerySchema>;

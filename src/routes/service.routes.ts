@@ -3,12 +3,15 @@ import { Router } from "express";
 import { verifyToken } from "../middleware/verifyToken.js";
 import { verifyTechnician } from "../middleware/verifyTechnician.js";
 import { verifyAdmin } from "../middleware/verifyAdmin.js";
-import { createService, updateService, deleteService, approveService, rejectService, listServices } from "../controllers/service.controller.js";
+import { createService, updateService, deleteService, approveService, rejectService, listServices, listMyServices } from "../controllers/service.controller.js";
 
 const router = Router();
 
 // GET / is intentionally public: only approved + available services are exposed.
 router.get("/", listServices);
+// Static /my must be registered before the dynamic /:id routes below so it
+// can never be shadowed by them.
+router.get("/my", verifyToken, verifyTechnician, listMyServices);
 
 // Middleware order matters: JWT first, then role. Never trust body roles.
 router.post("/", verifyToken, verifyTechnician, createService);
