@@ -1,5 +1,5 @@
 import type { Response } from "express";
-import { ObjectId } from "mongodb";
+import { ObjectId, type Filter } from "mongodb";
 import type { AuthenticatedRequest } from "../middleware/verifyToken.js";
 import { getDB, mongoClient } from "../config/db.js";
 import { verifyPassword } from "better-auth/crypto";
@@ -12,8 +12,15 @@ import {
   adminServicesQuerySchema,
   updateUserRoleSchema,
   mainAdminTransferSchema,
+  adminPaymentsQuerySchema,
   adminSearchFilter,
 } from "../validators/admin.validator.js";
+import {
+  getPaymentsCollection,
+  type Payment,
+  type PaymentStatus,
+} from "../models/payment.model.js";
+import { toMinorUnits, fromMinorUnits } from "../utils/currency.js";
 
 // Better Auth stores credential password hashes on the `account` collection
 // (providerId "credential"). Read directly by the transfer re-auth path only;
@@ -31,6 +38,74 @@ const dateOrNull = (value: unknown): string | null =>
   value instanceof Date ? value.toISOString() : null;
 const stringOrNull = (value: unknown): string | null =>
   typeof value === "string" && value.length > 0 ? value : null;
+
+/** Safe admin payment DTO — no checkout URLs, no webhook signatures, no
+ *  password hashes or other internal/account secrets. The Stripe Checkout
+ *  Session id and payment intent id are identifiers, not secrets, and are
+ *  useful for reconciliation; everything else is a plain field or null. */
+const toAdminPaymentDto = (
+  payment: Payment,
+  customer: { name: string | null; email: string | null } | undefined
+) => ({
+  id: payment._id.toHexString(),
+  bookingId: payment.bookingId.toHexString(),
+  customerName: customer?.name ?? null,
+  customerEmail: customer?.email ?? null,
+  reference: stringOrNull(payment.stripeSessionId),
+  paymentIntentId: stringOrNull(payment.stripePaymentIntentId),
+  amount: fromMinorUnits(payment.amount, payment.currency),
+  amountMinor: payment.amount,
+  currency: payment.currency,
+  status: payment.status,
+  createdAt: payment.createdAt instanceof Date ? payment.createdAt.toISOString() : String(payment.createdAt),
+  updatedAt: payment.updatedAt instanceof Date ? payment.updatedAt.toISOString() : String(payment.updatedAt),
+  paidAt: dateOrNull(payment.paidAt),
+});
+
+/** Summary for the admin payments view. Aggregates the filtered dataset
+ *  (identically scoped search/date, WITHOUT the status filter) straight in
+ *  MongoDB — documents are never loaded into memory in bulk. Amounts are
+ *  kept per currency: summing different currencies into one number would
+ *  be meaningless. */
+interface PaymentSummary {
+  successfulPayments: number;
+  successfulAmountByCurrency: Array<{ currency: string; amount: number }>;
+  pendingPayments: number;
+  failedPayments: number;
+  expiredPayments: number;
+}
+
+const summarizePayments = async (
+  filter: Filter<Payment>
+): Promise<PaymentSummary> => {
+  const [statusRows, amountRows] = await Promise.all([
+    getPaymentsCollection()
+      .aggregate<{ _id: PaymentStatus; count: number }>([
+        { $match: filter },
+        { $group: { _id: "$status", count: { $sum: 1 } } },
+      ])
+      .toArray(),
+    getPaymentsCollection()
+      .aggregate<{ _id: string; total: number }>([
+        { $match: { ...filter, status: "succeeded" as PaymentStatus } },
+        { $group: { _id: "$currency", total: { $sum: "$amount" } } },
+      ])
+      .toArray(),
+  ]);
+
+  const byStatus = new Map(statusRows.map((row) => [row._id, row.count]));
+
+  return {
+    successfulPayments: byStatus.get("succeeded") ?? 0,
+    successfulAmountByCurrency: amountRows.map((row) => ({
+      currency: row._id,
+      amount: fromMinorUnits(row.total, row._id),
+    })),
+    pendingPayments: byStatus.get("pending") ?? 0,
+    failedPayments: byStatus.get("failed") ?? 0,
+    expiredPayments: byStatus.get("expired") ?? 0,
+  };
+};
 
 /** True Main Admin designation comes from the server-managed user document
  *  field `isMainAdmin` — never from the JWT, never from client input. */
@@ -700,6 +775,117 @@ export const listServicesForAdmin = async (
   res.status(200).json({
     success: true,
     data: items.map(toAdminServiceDto),
+    pagination: { currentPage: page, limit, totalItems, totalPages, hasNextPage: page < totalPages, hasPrevPage: page > 1 },
+  });
+};
+
+// GET /api/admin/payments — paginated Stripe checkout payments across all
+// customers, newest first. Read-only by design: the only authority on a
+// payment's status is the verified Stripe webhook. Admin-only via
+// verifyToken -> verifyAdmin at the route layer.
+export const listPaymentsForAdmin = async (
+  req: AuthenticatedRequest,
+  res: Response
+): Promise<void> => {
+  const parsed = adminPaymentsQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    res.status(400).json({ success: false, message: "Validation failed.", errors: issues(parsed.error) });
+    return;
+  }
+
+  const { status, from, to, search } = parsed.data;
+  const page = parsed.data.page ?? 1;
+  // Chosen behaviour (consistent with other admin lists): limit above 50 is rejected with 400.
+  const limit = parsed.data.limit ?? 12;
+
+  const filter: Filter<Payment> = {};
+
+  if (status) {
+    filter.status = status;
+  }
+
+  if (from) {
+    filter.createdAt = { $gte: new Date(`${from}T00:00:00.000Z`) };
+  }
+  if (to) {
+    filter.createdAt = { ...(filter.createdAt ?? {}), $lte: new Date(`${to}T23:59:59.999Z`) };
+  }
+
+  const pattern = adminSearchFilter(search);
+
+  if (pattern && typeof search === "string") {
+    const trimmed = search.trim();
+    const hexId = OBJECT_ID_HEX_REGEX.test(trimmed) ? new ObjectId(trimmed) : null;
+    const userMatches = await getUsersCollection()
+      .find(
+        {
+          $or: [
+            { name: { $regex: pattern, $options: "i" } },
+            { email: { $regex: pattern, $options: "i" } },
+          ],
+        },
+        { projection: { _id: 1 } }
+      )
+      .toArray();
+
+    const orConditions: Filter<Payment>[] = [
+      { stripeSessionId: { $regex: pattern, $options: "i" } },
+      { stripePaymentIntentId: { $regex: pattern, $options: "i" } },
+    ];
+
+    if (userMatches.length > 0) {
+      orConditions.push({ customerId: { $in: userMatches.map((user) => user._id) } });
+    }
+
+    if (hexId) {
+      orConditions.push({ _id: hexId });
+      orConditions.push({ bookingId: hexId });
+    }
+
+    filter.$or = orConditions;
+  }
+
+  // Summary is computed on the same search/date scope but deliberately
+  // ignores the status filter so the cards stay meaningful while drilling.
+  const summaryFilter: Filter<Payment> = { ...filter };
+  delete summaryFilter.status;
+
+  const [items, totalItems, summary] = await Promise.all([
+    getPaymentsCollection()
+      .find(filter)
+      .sort({ createdAt: -1, _id: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .toArray(),
+    getPaymentsCollection().countDocuments(filter),
+    summarizePayments(summaryFilter),
+  ]);
+
+  const customerIds = [
+    ...new Set(items.map((payment) => payment.customerId.toHexString())),
+  ].map((id) => new ObjectId(id));
+  const customers = customerIds.length
+    ? await getUsersCollection()
+        .find({ _id: { $in: customerIds } }, { projection: { name: 1, email: 1 } })
+        .toArray()
+    : [];
+  const customerMap = new Map(
+    customers.map((customer) => [
+      customer._id.toHexString(),
+      {
+        name: stringOrNull(customer.name),
+        email: stringOrNull(customer.email),
+      },
+    ])
+  );
+
+  const totalPages = totalItems === 0 ? 0 : Math.ceil(totalItems / limit);
+  res.status(200).json({
+    success: true,
+    data: items.map((payment) =>
+      toAdminPaymentDto(payment, customerMap.get(payment.customerId.toHexString()))
+    ),
+    summary,
     pagination: { currentPage: page, limit, totalItems, totalPages, hasNextPage: page < totalPages, hasPrevPage: page > 1 },
   });
 };

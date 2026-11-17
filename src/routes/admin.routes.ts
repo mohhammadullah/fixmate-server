@@ -9,6 +9,7 @@ import {
   transferMainAdmin,
   listAllBookings,
   listServicesForAdmin,
+  listPaymentsForAdmin,
 } from "../controllers/admin.controller.js";
 
 const router = Router();
@@ -26,5 +27,8 @@ router.get("/bookings", verifyToken, verifyAdmin, listAllBookings);
 
 // Admin service moderation queue (pending by default).
 router.get("/services", verifyToken, verifyAdmin, listServicesForAdmin);
+
+// Admin payments listing (read-only; statuses are owned by the Stripe webhook).
+router.get("/payments", verifyToken, verifyAdmin, listPaymentsForAdmin);
 
 export default router;

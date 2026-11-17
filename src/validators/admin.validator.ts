@@ -1,6 +1,13 @@
 import { z } from "zod";
-import { BOOKING_STATUSES, PAYMENT_STATUSES } from "../models/booking.model.js";
+import {
+  BOOKING_STATUSES,
+  PAYMENT_STATUSES,
+} from "../models/booking.model.js";
 import { SERVICE_APPROVAL_STATUSES } from "../models/service.model.js";
+// The payments collection has its own lifecycle (pending/succeeded/failed/expired),
+// exported from payment.model.js under the same name — alias to avoid collision
+// with the booking-level PAYMENT_STATUSES above.
+import { PAYMENT_STATUSES as PAYMENT_RECORD_STATUSES } from "../models/payment.model.js";
 import { escapeRegExp } from "../validators/service.validator.js";
 
 const positiveInt = z.coerce.number().int().min(1).optional();
@@ -31,6 +38,33 @@ export const adminBookingsQuerySchema = z.object({
   page: positiveInt,
   limit: limitedInt,
 });
+
+// Admin payments listing (GET /api/admin/payments). Strict validation;
+// unknown query keys are stripped. `from`/`to` are inclusive calendar days
+// (YYYY-MM-DD, interpreted in UTC). Chosen behaviour as elsewhere: a limit
+// above 50 is rejected with 400 rather than silently capped.
+const dateQuerySchema = z
+  .string({ error: "Date must be a string in YYYY-MM-DD format" })
+  .trim()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, "Date must be in YYYY-MM-DD format")
+  .refine((value) => !Number.isNaN(Date.parse(value)), "Date must be valid")
+  .optional();
+
+export const adminPaymentsQuerySchema = z
+  .object({
+    status: z.enum(PAYMENT_RECORD_STATUSES, {
+      error: `Status must be one of: ${PAYMENT_RECORD_STATUSES.join(", ")}`,
+    }).optional(),
+    from: dateQuerySchema,
+    to: dateQuerySchema,
+    search: trimmedQuery,
+    page: positiveInt,
+    limit: limitedInt,
+  })
+  .refine(
+    (data) => !data.from || !data.to || data.from <= data.to,
+    { message: "from must be on or before to", path: ["from"] }
+  );
 
 // Admin service moderation listing. Defaults to pending services — this is
 // the review queue. Other statuses remain available for follow-up.
@@ -82,6 +116,7 @@ export type MainAdminTransferData = z.infer<typeof mainAdminTransferSchema>;
 export type AdminUsersQueryData = z.infer<typeof adminUsersQuerySchema>;
 export type AdminBookingsQueryData = z.infer<typeof adminBookingsQuerySchema>;
 export type AdminServicesQueryData = z.infer<typeof adminServicesQuerySchema>;
+export type AdminPaymentsQueryData = z.infer<typeof adminPaymentsQuerySchema>;
 
 export const adminSearchFilter = (search: string | undefined) =>
   search ? escapeRegExp(search) : null;

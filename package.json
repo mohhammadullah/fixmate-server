@@ -4,7 +4,7 @@
   "description": "",
   "main": "dist/server.js",
   "scripts": {
-    "test": "node scripts/payments-test.mjs && node scripts/smoke-test.mjs && node scripts/booking-details-test.mjs && node scripts/my-services-test.mjs && node scripts/service-details-test.mjs && node scripts/technician-applications-test.mjs && node scripts/admin-dashboard-test.mjs && node scripts/admin-services-test.mjs && node scripts/profile-test.mjs && node scripts/main-admin-test.mjs && npx tsx scripts/image-upload-test.mjs",
+    "test": "node scripts/payments-test.mjs && node scripts/smoke-test.mjs && node scripts/booking-details-test.mjs && node scripts/my-services-test.mjs && node scripts/service-details-test.mjs && node scripts/technician-applications-test.mjs && node scripts/admin-dashboard-test.mjs && node scripts/admin-payments-test.mjs && node scripts/admin-services-test.mjs && node scripts/profile-test.mjs && node scripts/main-admin-test.mjs && npx tsx scripts/image-upload-test.mjs",
     "bootstrap:admin": "node scripts/bootstrap-admin.mjs",
     "dev": "tsx watch src/server.ts",
     "build": "tsc",

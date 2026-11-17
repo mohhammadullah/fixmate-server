@@ -103,6 +103,16 @@ export const paymentIndexes: IndexDescription[] = [
     key: { customerId: 1, createdAt: -1 },
     name: "payments_customerId_1_createdAt_-1",
   },
+  // Supports the admin payments listing (newest-first, optional status
+  // filter). Filtered or unfiltered alike.
+  {
+    key: { status: 1, createdAt: -1 },
+    name: "payments_status_1_createdAt_-1",
+  },
+  {
+    key: { createdAt: -1 },
+    name: "payments_createdAt_-1",
+  },
 ];
 
 // Index on the `user` collection supporting admin application listings.
