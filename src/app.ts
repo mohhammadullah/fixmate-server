@@ -45,6 +45,20 @@ export const createApp = (auth: Auth) => {
     },
   });
 
+  // Broad ceiling for the rest of the API: normal browser usage never
+  // approaches it, abuse does. The auth bucket above stays tighter.
+  const apiLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 600,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: {
+      success: false,
+      message: "Too many requests, please try again later.",
+    },
+  });
+
+
   // Better Auth handler MUST be mounted before express.json() so it can
   // read the raw request body itself. Express 5 requires a named wildcard
   // ({*any}) — a bare "*" is no longer valid path-to-regexp syntax.
@@ -59,6 +73,9 @@ export const createApp = (auth: Auth) => {
     "/api/payments/webhook",
     express.raw({ type: "application/json", limit: "100kb" })
   );
+
+  // Keep the general budget for non-auth traffic.
+  app.use("/api", apiLimiter);
 
   app.use(express.json({ limit: "100kb" }));
 

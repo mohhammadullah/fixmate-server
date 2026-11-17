@@ -290,6 +290,111 @@ export const getUserById = async (
   res.status(200).json({ success: true, data: toUserDto(user) });
 };
 
+// Domain errors raised inside the admin-demotion transaction. The update
+// aborts; each reason maps to a safe HTTP response without leaking internals.
+class AdminDemotionError extends Error {
+  readonly reason: string;
+  constructor(reason: string) {
+    super(reason);
+    this.name = "AdminDemotionError";
+    this.reason = reason;
+  }
+}
+
+const mapAdminDemotionError = (
+  reason: string
+): { status: number; message: string } => {
+  switch (reason) {
+    case "actor-not-main":
+      return { status: 403, message: "Only the Main Admin can demote an admin." };
+    case "target-is-main":
+      return { status: 409, message: "The Main Admin cannot be demoted or modified." };
+    default:
+      // target-changed / target-missing — keep responses indistinguishable.
+      return { status: 409, message: "User role changed concurrently. Refresh and try again." };
+  }
+};
+
+// Demotes an admin inside a MongoDB transaction. Every check is re-read
+// inside the transaction: the actor must still hold the Main Admin
+// designation, the target must still be an admin and must not be the Main
+// Admin. No non-atomic fallback — without transaction support the demotion
+// cannot proceed.
+const demoteAdminAtomically = async (
+  res: Response,
+  adminId: ObjectId,
+  targetId: ObjectId,
+  nextRole: "customer" | "technician"
+): Promise<void> => {
+  const users = getUsersCollection();
+  const session = mongoClient.startSession();
+
+  try {
+    await session.withTransaction(async () => {
+      // NOTE: MongoDB allows exactly one operation per transaction session
+      // at a time — all commands run sequentially.
+      const freshActor = await users.findOne(
+        { _id: adminId },
+        { projection: { isMainAdmin: 1 }, session }
+      );
+
+      if (!freshActor || freshActor.isMainAdmin !== true) {
+        throw new AdminDemotionError("actor-not-main");
+      }
+
+      const freshTarget = await users.findOne(
+        { _id: targetId },
+        { projection: { role: 1, isMainAdmin: 1, technicianApplication: 1 }, session }
+      );
+
+      if (!freshTarget || freshTarget.role !== "admin") {
+        throw new AdminDemotionError("target-changed");
+      }
+
+      if (freshTarget.isMainAdmin === true) {
+        throw new AdminDemotionError("target-is-main");
+      }
+
+      const updated = await users.findOneAndUpdate(
+        { _id: targetId, role: "admin" },
+        { $set: { role: nextRole, updatedAt: new Date() } },
+        { returnDocument: "after", session }
+      );
+
+      if (!updated) {
+        throw new AdminDemotionError("target-changed");
+      }
+
+      res.status(200).json({
+        success: true,
+        message: `Role updated to ${nextRole}.`,
+        data: toUserDto(updated),
+      });
+    });
+  } catch (error) {
+    if (error instanceof AdminDemotionError) {
+      const mapped = mapAdminDemotionError(error.reason);
+      res.status(mapped.status).json({ success: false, message: mapped.message });
+      return;
+    }
+
+    if (isTransactionUnsupportedError(error)) {
+      console.error("Admin demotion aborted: transactions unsupported by this MongoDB deployment.");
+      res.status(503).json({
+        success: false,
+        message: "Admin demotion is not supported in this environment.",
+      });
+      return;
+    }
+
+    // The transaction aborted unexpectedly; the handler's error propagates
+    // to Express 5's errorHandler, same shape as any other 500.
+    throw error;
+  } finally {
+    await session.endSession();
+  }
+};
+
 // PATCH /api/admin/users/:id/role — tightly constrained role changes.
 // Main Admin hierarchy rules:
 // - an admin may promote an existing customer/technician to admin (never
@@ -301,6 +406,9 @@ export const getUserById = async (
 //   ever reach this point targeting the Main Admin;
 // - an admin cannot change their own role (self-promotion/demotion);
 // - customer -> technician requires an approved application;
+// - admin demotions run inside a MongoDB transaction so the caller must
+//   still hold the Main Admin designation when the write lands (the same
+//   guarantee as the transfer endpoint); there is no non-atomic fallback.
 // - updates are atomic and guarded by the current role.
 export const updateUserRole = async (
   req: AuthenticatedRequest,
@@ -362,32 +470,12 @@ export const updateUserRole = async (
     }
   }
 
-  // Admin demotion rules. Normal Admins can never demote an admin (403) —
-  // regardless of who the target is. Only the Main Admin may demote a
-  // Normal Admin (they cannot demote themself — self-changes are rejected
-  // above — and nobody may demote or modify the Main Admin).
+  // Admin demotion rules. Active inside a transaction (see
+  // demoteAdminAtomically) so the caller must still hold the Main Admin
+  // designation when the write commits — a racing ownership transfer cannot
+  // grant demotion rights to a normal admin mid-flight.
   if (currentRole === "admin" && nextRole !== "admin") {
-    // The demoting caller must themselves be the Main Admin.
-    const actor = await getUsersCollection().findOne(
-      { _id: adminId },
-      { projection: { isMainAdmin: 1 } }
-    );
-
-    if (!isMainAdmin(actor)) {
-      res.status(403).json({
-        success: false,
-        message: "Only the Main Admin can demote an admin.",
-      });
-      return;
-    }
-
-    if (isMainAdmin(target)) {
-      res.status(409).json({
-        success: false,
-        message: "The Main Admin cannot be demoted or modified.",
-      });
-      return;
-    }
+    return demoteAdminAtomically(res, adminId, targetId, nextRole);
   }
 
   const updated = await getUsersCollection().findOneAndUpdate(
