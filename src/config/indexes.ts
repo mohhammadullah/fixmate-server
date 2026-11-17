@@ -7,6 +7,7 @@ import {
   ACTIVE_BOOKING_STATUSES,
 } from "../models/booking.model.js";
 import { USERS_COLLECTION } from "../models/technician-application.model.js";
+import { PAYMENTS_COLLECTION } from "../models/payment.model.js";
 
 // Index definitions for the `services` collection.
 //
@@ -69,6 +70,41 @@ export const bookingIndexes: IndexDescription[] = [
   },
 ];
 
+// Index definitions for the `payments` collection.
+//
+// - At most one pending checkout may exist per booking, enforced by the
+//   partial unique index (concurrent requests race to insert and the
+//   loser matches no pending record and simply reuses it).
+// - At most one succeeded payment per booking, so a booking can never be
+//   settled twice, even if two sessions were somehow opened.
+// - stripeSessionId is unique across the collection; it is absent while a
+//   Checkout Session is being created, so the index is sparse.
+// - { customerId: 1, createdAt: -1 } supports the payment-history listing.
+export const paymentIndexes: IndexDescription[] = [
+  {
+    key: { bookingId: 1 },
+    name: "payments_one_pending_per_booking_unique",
+    unique: true,
+    partialFilterExpression: { status: "pending" },
+  },
+  {
+    key: { bookingId: 1 },
+    name: "payments_one_succeeded_per_booking_unique",
+    unique: true,
+    partialFilterExpression: { status: "succeeded" },
+  },
+  {
+    key: { stripeSessionId: 1 },
+    name: "payments_stripeSessionId_unique_sparse",
+    unique: true,
+    sparse: true,
+  },
+  {
+    key: { customerId: 1, createdAt: -1 },
+    name: "payments_customerId_1_createdAt_-1",
+  },
+];
+
 // Index on the `user` collection supporting admin application listings.
 // No new collection is created — the application is a subdocument.
 export const userIndexes: IndexDescription[] = [
@@ -83,11 +119,18 @@ export const userIndexes: IndexDescription[] = [
 export const ensureIndexes = async (): Promise<string[]> => {
   const db = getDB();
 
-  const [serviceIndexNames, bookingIndexNames, userIndexNames] = await Promise.all([
-    db.collection(SERVICES_COLLECTION).createIndexes(servicesIndexes),
-    db.collection(BOOKINGS_COLLECTION).createIndexes(bookingIndexes),
-    db.collection(USERS_COLLECTION).createIndexes(userIndexes),
-  ]);
+  const [serviceIndexNames, bookingIndexNames, paymentIndexNames, userIndexNames] =
+    await Promise.all([
+      db.collection(SERVICES_COLLECTION).createIndexes(servicesIndexes),
+      db.collection(BOOKINGS_COLLECTION).createIndexes(bookingIndexes),
+      db.collection(PAYMENTS_COLLECTION).createIndexes(paymentIndexes),
+      db.collection(USERS_COLLECTION).createIndexes(userIndexes),
+    ]);
 
-  return [...serviceIndexNames, ...bookingIndexNames, ...userIndexNames];
+  return [
+    ...serviceIndexNames,
+    ...bookingIndexNames,
+    ...paymentIndexNames,
+    ...userIndexNames,
+  ];
 };

@@ -21,6 +21,23 @@ const envSchema = z.object({
     .string()
     .min(32, "BETTER_AUTH_SECRET must be at least 32 characters long"),
   BETTER_AUTH_URL: z.string().url("BETTER_AUTH_URL must be a valid URL"),
+  // Optional so the server and test suite can start without Stripe
+  // credentials. Endpoints that need Stripe return a safe 503 when it is
+  // not configured; the rest of the API keeps working.
+  STRIPE_SECRET_KEY: z.string().min(1).optional(),
+  STRIPE_WEBHOOK_SECRET: z.string().min(1).optional(),
+  // Lowercase ISO 4217 currency used for new Checkout Sessions.
+  // Safe default: usd. Set to bdt only when your Stripe account and
+  // payment method support BDT.
+  STRIPE_CURRENCY: z
+    .string()
+    .trim()
+    .toLowerCase()
+    .regex(/^[a-z]{3}$/, "STRIPE_CURRENCY must be a lowercase 3-letter ISO 4217 code")
+    .default("usd"),
+  // Overridable for a local mock of the Stripe API in tests. Never set in
+  // production.
+  STRIPE_API_BASE: z.string().url().optional(),
   // Optional so the server and test suite can start without an ImgBB account.
   // The upload endpoint refuses requests with a safe 503 when it is missing.
   IMGBB_API_KEY: z.string().min(1).optional(),

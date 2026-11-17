@@ -12,6 +12,7 @@ import technicianApplicationRoutes from "./routes/technician-application.routes.
 import adminRoutes from "./routes/admin.routes.js";
 import userRoutes from "./routes/user.routes.js";
 import uploadRoutes from "./routes/upload.routes.js";
+import paymentRoutes from "./routes/payment.routes.js";
 import { errorHandler, notFoundHandler } from "./middleware/errorHandler.js";
 import { env } from "./config/env.js";
 import type { Auth } from "./config/auth.js";
@@ -50,6 +51,15 @@ export const createApp = (auth: Auth) => {
   app.use("/api/auth", authLimiter);
   app.all("/api/auth/{*any}", toNodeHandler(auth));
 
+  // The Stripe webhook must see the raw request body for signature
+  // verification. Mounted before express.json() so every other route keeps
+  // normal JSON parsing; express.json() skips this path because the raw
+  // parser has already consumed the body.
+  app.use(
+    "/api/payments/webhook",
+    express.raw({ type: "application/json", limit: "100kb" })
+  );
+
   app.use(express.json({ limit: "100kb" }));
 
   app.get("/", (_req, res) => {
@@ -74,6 +84,7 @@ export const createApp = (auth: Auth) => {
   app.use("/api/admin", adminRoutes);
   app.use("/api/users", userRoutes);
   app.use("/api/uploads", uploadRoutes);
+  app.use("/api/payments", paymentRoutes);
 
   app.use(notFoundHandler);
   app.use(errorHandler);
