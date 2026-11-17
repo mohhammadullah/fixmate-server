@@ -3,11 +3,12 @@ import { ObjectId } from "mongodb";
 import type { AuthenticatedRequest } from "../middleware/verifyToken.js";
 import { getDB } from "../config/db.js";
 import { getUsersCollection, type UserWithApplication } from "../models/technician-application.model.js";
-import { getServicesCollection } from "../models/service.model.js";
+import { getServicesCollection, type Service } from "../models/service.model.js";
 import { getBookingsCollection, type Booking } from "../models/booking.model.js";
 import {
   adminUsersQuerySchema,
   adminBookingsQuerySchema,
+  adminServicesQuerySchema,
   updateUserRoleSchema,
   adminSearchFilter,
 } from "../validators/admin.validator.js";
@@ -339,6 +340,79 @@ export const listAllBookings = async (
   res.status(200).json({
     success: true,
     data: items.map(toBookingDto),
+    pagination: { currentPage: page, limit, totalItems, totalPages, hasNextPage: page < totalPages, hasPrevPage: page > 1 },
+  });
+};
+
+/** Safe admin service DTO — all technician-editable business fields plus
+ *  public technician identity (needed for moderation), without internal
+ *  ObjectId references or account secrets. */
+const toAdminServiceDto = (service: Service) => ({
+  id: service._id.toHexString(),
+  title: service.title,
+  category: service.category,
+  description: service.description,
+  overview: service.overview,
+  hourlyRate: service.hourlyRate,
+  securityDeposit: service.securityDeposit,
+  maxCapacity: service.maxCapacity,
+  location: service.location,
+  image: service.image,
+  amenities: service.amenities ?? [],
+  approvalStatus: service.approvalStatus,
+  availabilityStatus: service.availabilityStatus,
+  rejectionReason: service.rejectionReason ?? null,
+  technicianName: service.technicianName,
+  technicianEmail: service.technicianEmail,
+  createdAt: service.createdAt instanceof Date ? service.createdAt.toISOString() : String(service.createdAt),
+  updatedAt: service.updatedAt instanceof Date ? service.updatedAt.toISOString() : String(service.updatedAt),
+});
+
+// GET /api/admin/services — admin-only moderation listing, newest first.
+// Defaults to pending services. /api/services/my cannot serve this purpose:
+// it is technician-only and scoped to the caller's own documents.
+export const listServicesForAdmin = async (
+  req: AuthenticatedRequest,
+  res: Response
+): Promise<void> => {
+  const parsed = adminServicesQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    res.status(400).json({ success: false, message: "Validation failed.", errors: issues(parsed.error) });
+    return;
+  }
+  const { status, search } = parsed.data;
+  const page = parsed.data.page ?? 1;
+  const limit = parsed.data.limit ?? 12;
+  const pattern = adminSearchFilter(search);
+
+  const filter = {
+    approvalStatus: status,
+    ...(pattern
+      ? {
+          $or: [
+            { title: { $regex: pattern, $options: "i" as const } },
+            { category: { $regex: pattern, $options: "i" as const } },
+            { location: { $regex: pattern, $options: "i" as const } },
+            { technicianName: { $regex: pattern, $options: "i" as const } },
+          ],
+        }
+      : {}),
+  };
+
+  const [items, totalItems] = await Promise.all([
+    getServicesCollection()
+      .find(filter)
+      .sort({ createdAt: -1, _id: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .toArray(),
+    getServicesCollection().countDocuments(filter),
+  ]);
+
+  const totalPages = totalItems === 0 ? 0 : Math.ceil(totalItems / limit);
+  res.status(200).json({
+    success: true,
+    data: items.map(toAdminServiceDto),
     pagination: { currentPage: page, limit, totalItems, totalPages, hasNextPage: page < totalPages, hasPrevPage: page > 1 },
   });
 };

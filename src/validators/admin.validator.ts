@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { BOOKING_STATUSES, PAYMENT_STATUSES } from "../models/booking.model.js";
+import { SERVICE_APPROVAL_STATUSES } from "../models/service.model.js";
 import { escapeRegExp } from "../validators/service.validator.js";
 
 const positiveInt = z.coerce.number().int().min(1).optional();
@@ -27,6 +28,17 @@ export const adminBookingsQuerySchema = z.object({
   paymentStatus: z.enum(PAYMENT_STATUSES, {
     error: `Payment status must be one of: ${PAYMENT_STATUSES.join(", ")}`,
   }).optional(),
+  page: positiveInt,
+  limit: limitedInt,
+});
+
+// Admin service moderation listing. Defaults to pending services — this is
+// the review queue. Other statuses remain available for follow-up.
+export const adminServicesQuerySchema = z.object({
+  status: z.enum(SERVICE_APPROVAL_STATUSES, {
+    error: `Status must be one of: ${SERVICE_APPROVAL_STATUSES.join(", ")}`,
+  }).default("pending"),
+  search: trimmedQuery,
   page: positiveInt,
   limit: limitedInt,
 });
