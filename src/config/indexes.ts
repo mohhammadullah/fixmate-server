@@ -2,6 +2,10 @@
 import type { IndexDescription } from "mongodb";
 import { getDB } from "./db.js";
 import { SERVICES_COLLECTION } from "../models/service.model.js";
+import {
+  BOOKINGS_COLLECTION,
+  ACTIVE_BOOKING_STATUSES,
+} from "../models/booking.model.js";
 
 // Index definitions for the `services` collection.
 //
@@ -32,10 +36,47 @@ export const servicesIndexes: IndexDescription[] = [
   },
 ];
 
+// Index definitions for the `bookings` collection.
+//
+// The partial unique index is the authoritative guard against duplicate
+// ACTIVE bookings for the same (customerId, serviceId). Only bookings whose
+// status is requested/accepted/in-progress are covered, so completed,
+// rejected or cancelled bookings never block a fresh booking. MongoDB
+// 8.0.x supports partialFilterExpression for unique indexes. Enforced at
+// the database level, it cannot be bypassed by concurrent requests racing
+// past an application-level pre-check; violations surface as error 11000.
+export const bookingIndexes: IndexDescription[] = [
+  {
+    key: { customerId: 1, serviceId: 1 },
+    name: "bookings_active_customer_service_unique",
+    unique: true,
+    partialFilterExpression: {
+      status: { $in: [...ACTIVE_BOOKING_STATUSES] },
+    },
+  },
+  {
+    key: { technicianId: 1, status: 1 },
+    name: "bookings_technicianId_1_status_1",
+  },
+  {
+    key: { customerId: 1, status: 1 },
+    name: "bookings_customerId_1_status_1",
+  },
+  {
+    key: { createdAt: -1 },
+    name: "bookings_createdAt_-1",
+  },
+];
+
 // Creates the indexes once, at startup. createIndexes is idempotent, so
 // re-running against identical definitions is a no-op on the server side.
 export const ensureIndexes = async (): Promise<string[]> => {
   const db = getDB();
 
-  return db.collection(SERVICES_COLLECTION).createIndexes(servicesIndexes);
+  const [serviceIndexNames, bookingIndexNames] = await Promise.all([
+    db.collection(SERVICES_COLLECTION).createIndexes(servicesIndexes),
+    db.collection(BOOKINGS_COLLECTION).createIndexes(bookingIndexes),
+  ]);
+
+  return [...serviceIndexNames, ...bookingIndexNames];
 };
