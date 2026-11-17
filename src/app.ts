@@ -10,6 +10,7 @@ import serviceRoutes from "./routes/service.routes.js";
 import bookingRoutes from "./routes/booking.routes.js";
 import technicianApplicationRoutes from "./routes/technician-application.routes.js";
 import adminRoutes from "./routes/admin.routes.js";
+import userRoutes from "./routes/user.routes.js";
 import { errorHandler, notFoundHandler } from "./middleware/errorHandler.js";
 import { env } from "./config/env.js";
 import type { Auth } from "./config/auth.js";
@@ -70,6 +71,7 @@ export const createApp = (auth: Auth) => {
   app.use("/api/bookings", bookingRoutes);
   app.use("/api/technician-applications", technicianApplicationRoutes);
   app.use("/api/admin", adminRoutes);
+  app.use("/api/users", userRoutes);
 
   app.use(notFoundHandler);
   app.use(errorHandler);
