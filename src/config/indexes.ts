@@ -6,6 +6,7 @@ import {
   BOOKINGS_COLLECTION,
   ACTIVE_BOOKING_STATUSES,
 } from "../models/booking.model.js";
+import { USERS_COLLECTION } from "../models/technician-application.model.js";
 
 // Index definitions for the `services` collection.
 //
@@ -68,15 +69,25 @@ export const bookingIndexes: IndexDescription[] = [
   },
 ];
 
+// Index on the `user` collection supporting admin application listings.
+// No new collection is created — the application is a subdocument.
+export const userIndexes: IndexDescription[] = [
+  {
+    key: { "technicianApplication.status": 1, "technicianApplication.submittedAt": -1 },
+    name: "user_technicianApplication_status_1_submittedAt_-1",
+  },
+];
+
 // Creates the indexes once, at startup. createIndexes is idempotent, so
 // re-running against identical definitions is a no-op on the server side.
 export const ensureIndexes = async (): Promise<string[]> => {
   const db = getDB();
 
-  const [serviceIndexNames, bookingIndexNames] = await Promise.all([
+  const [serviceIndexNames, bookingIndexNames, userIndexNames] = await Promise.all([
     db.collection(SERVICES_COLLECTION).createIndexes(servicesIndexes),
     db.collection(BOOKINGS_COLLECTION).createIndexes(bookingIndexes),
+    db.collection(USERS_COLLECTION).createIndexes(userIndexes),
   ]);
 
-  return [...serviceIndexNames, ...bookingIndexNames];
+  return [...serviceIndexNames, ...bookingIndexNames, ...userIndexNames];
 };
