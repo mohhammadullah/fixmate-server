@@ -9,6 +9,7 @@ import testRoutes from "./routes/test.routes.js";
 import serviceRoutes from "./routes/service.routes.js";
 import bookingRoutes from "./routes/booking.routes.js";
 import technicianApplicationRoutes from "./routes/technician-application.routes.js";
+import adminRoutes from "./routes/admin.routes.js";
 import { errorHandler, notFoundHandler } from "./middleware/errorHandler.js";
 import { env } from "./config/env.js";
 import type { Auth } from "./config/auth.js";
@@ -68,6 +69,7 @@ export const createApp = (auth: Auth) => {
   app.use("/api/services", serviceRoutes);
   app.use("/api/bookings", bookingRoutes);
   app.use("/api/technician-applications", technicianApplicationRoutes);
+  app.use("/api/admin", adminRoutes);
 
   app.use(notFoundHandler);
   app.use(errorHandler);
