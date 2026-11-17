@@ -1,6 +1,7 @@
 
 import type { Server } from "node:http";
 import { connectDB, closeDB } from "./config/db.js";
+import { ensureIndexes } from "./config/indexes.js";
 import { createAuth } from "./config/auth.js";
 import { createApp } from "./app.js";
 import { env } from "./config/env.js";
@@ -9,6 +10,19 @@ const startServer = async (): Promise<void> => {
   // Connect to MongoDB BEFORE creating Better Auth so the adapter
   // always sees a live Db instance.
   await connectDB();
+
+  // Create MongoDB indexes once at startup (never per request). Kept
+  // non-fatal so index provisioning issues cannot block Better Auth
+  // initialization or server startup; failures are logged loudly instead.
+  try {
+    const indexNames = await ensureIndexes();
+    console.log(`MongoDB indexes ensured: ${indexNames.join(", ")}`);
+  } catch (error) {
+    console.error(
+      "Failed to create MongoDB indexes. Server will start anyway:",
+      error
+    );
+  }
 
   const auth = createAuth();
   const app = createApp(auth);
