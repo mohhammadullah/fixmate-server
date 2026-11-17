@@ -6,6 +6,7 @@ import {
   listUsers,
   getUserById,
   updateUserRole,
+  transferMainAdmin,
   listAllBookings,
   listServicesForAdmin,
 } from "../controllers/admin.controller.js";
@@ -18,6 +19,8 @@ router.get("/dashboard/stats", verifyToken, verifyAdmin, getDashboardStats);
 router.get("/users", verifyToken, verifyAdmin, listUsers);
 router.get("/users/:id", verifyToken, verifyAdmin, getUserById);
 router.patch("/users/:id/role", verifyToken, verifyAdmin, updateUserRole);
+// Main Admin ownership handover — re-authenticated, transactional, Main Admin only.
+router.post("/main-admin/transfer", verifyToken, verifyAdmin, transferMainAdmin);
 
 router.get("/bookings", verifyToken, verifyAdmin, listAllBookings);
 

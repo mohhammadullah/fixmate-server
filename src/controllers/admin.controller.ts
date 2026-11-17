@@ -1,7 +1,8 @@
 import type { Response } from "express";
 import { ObjectId } from "mongodb";
 import type { AuthenticatedRequest } from "../middleware/verifyToken.js";
-import { getDB } from "../config/db.js";
+import { getDB, mongoClient } from "../config/db.js";
+import { verifyPassword } from "better-auth/crypto";
 import { getUsersCollection, type UserWithApplication } from "../models/technician-application.model.js";
 import { getServicesCollection, type Service } from "../models/service.model.js";
 import { getBookingsCollection, type Booking } from "../models/booking.model.js";
@@ -10,8 +11,14 @@ import {
   adminBookingsQuerySchema,
   adminServicesQuerySchema,
   updateUserRoleSchema,
+  mainAdminTransferSchema,
   adminSearchFilter,
 } from "../validators/admin.validator.js";
+
+// Better Auth stores credential password hashes on the `account` collection
+// (providerId "credential"). Read directly by the transfer re-auth path only;
+// nothing outside the server ever sees these values.
+const ACCOUNTS_COLLECTION = "account";
 
 const OBJECT_ID_HEX_REGEX = /^[0-9a-fA-F]{24}$/;
 const parseId = (raw: unknown): ObjectId | null =>
@@ -25,6 +32,11 @@ const dateOrNull = (value: unknown): string | null =>
 const stringOrNull = (value: unknown): string | null =>
   typeof value === "string" && value.length > 0 ? value : null;
 
+/** True Main Admin designation comes from the server-managed user document
+ *  field `isMainAdmin` — never from the JWT, never from client input. */
+const isMainAdmin = (user: UserWithApplication | null | undefined): boolean =>
+  user?.isMainAdmin === true;
+
 /** Safe admin user DTO — no password hashes, sessions, accounts, tokens or
  *  application subdocuments. */
 const toUserDto = (user: UserWithApplication) => ({
@@ -32,6 +44,9 @@ const toUserDto = (user: UserWithApplication) => ({
   name: stringOrNull(user.name),
   email: stringOrNull(user.email),
   role: stringOrNull(user.role) ?? "customer",
+  // Main Admin status is a public-ish flag needed to render the admin
+  // hierarchy; it carries no secret.
+  isMainAdmin: isMainAdmin(user),
   phone: stringOrNull(user.phone),
   area: stringOrNull(user.area),
   bio: stringOrNull(user.bio),
@@ -161,7 +176,7 @@ export const listUsers = async (
     getUsersCollection()
       .find(filter, {
         projection: {
-          name: 1, email: 1, role: 1, phone: 1, area: 1, bio: 1, createdAt: 1, updatedAt: 1,
+          name: 1, email: 1, role: 1, isMainAdmin: 1, phone: 1, area: 1, bio: 1, createdAt: 1, updatedAt: 1,
         },
       })
       .sort({ createdAt: -1, _id: -1 })
@@ -191,7 +206,7 @@ export const getUserById = async (
   }
   const user = await getUsersCollection().findOne(
     { _id: id },
-    { projection: { name: 1, email: 1, role: 1, phone: 1, area: 1, bio: 1, createdAt: 1, updatedAt: 1 } }
+    { projection: { name: 1, email: 1, role: 1, isMainAdmin: 1, phone: 1, area: 1, bio: 1, createdAt: 1, updatedAt: 1 } }
   );
   if (!user) {
     res.status(404).json({ success: false, message: "User not found." });
@@ -201,10 +216,15 @@ export const getUserById = async (
 };
 
 // PATCH /api/admin/users/:id/role — tightly constrained role changes.
-// Security rules:
-// - admin is never assignable here (bootstrap script is the only path);
-// - an admin cannot demote themselves;
-// - the last remaining admin cannot be demoted;
+// Main Admin hierarchy rules:
+// - an admin may promote an existing customer/technician to admin (never
+//   creating accounts, never touching passwords; promotion never grants
+//   Main Admin designation);
+// - only the Main Admin may demote an admin (Normal Admins receive 403);
+// - the Main Admin cannot be demoted or modified by anyone, including the
+//   Main Admin — self-changes are rejected above, so no other admin can
+//   ever reach this point targeting the Main Admin;
+// - an admin cannot change their own role (self-promotion/demotion);
 // - customer -> technician requires an approved application;
 // - updates are atomic and guarded by the current role.
 export const updateUserRole = async (
@@ -240,7 +260,7 @@ export const updateUserRole = async (
 
   const target = await getUsersCollection().findOne(
     { _id: targetId },
-    { projection: { role: 1, technicianApplication: 1 } }
+    { projection: { role: 1, isMainAdmin: 1, technicianApplication: 1 } }
   );
   if (!target) {
     res.status(404).json({ success: false, message: "User not found." });
@@ -253,26 +273,43 @@ export const updateUserRole = async (
     return;
   }
 
-  if (currentRole === "admin") {
-    const adminCount = await getUsersCollection().countDocuments({ role: "admin" });
-    if (adminCount <= 1) {
-      res.status(409).json({ success: false, message: "Cannot demote the last remaining admin." });
-      return;
-    }
-  }
-
-  if (nextRole === "technician") {
-    if (currentRole !== "customer") {
-      res.status(409).json({
-        success: false,
-        message: "Only customers with an approved technician application can become technicians.",
-      });
-      return;
-    }
+  // Technician promotions: only a customer can be promoted to technician,
+  // and only with an approved application. Other current roles fall through
+  // (technician -> technician is a 409 above; admin -> technician is an
+  // admin demotion, handled by the hierarchy rules below).
+  if (nextRole === "technician" && currentRole === "customer") {
     if (target.technicianApplication?.status !== "approved") {
       res.status(409).json({
         success: false,
         message: "This customer has no approved technician application.",
+      });
+      return;
+    }
+  }
+
+  // Admin demotion rules. Normal Admins can never demote an admin (403) —
+  // regardless of who the target is. Only the Main Admin may demote a
+  // Normal Admin (they cannot demote themself — self-changes are rejected
+  // above — and nobody may demote or modify the Main Admin).
+  if (currentRole === "admin" && nextRole !== "admin") {
+    // The demoting caller must themselves be the Main Admin.
+    const actor = await getUsersCollection().findOne(
+      { _id: adminId },
+      { projection: { isMainAdmin: 1 } }
+    );
+
+    if (!isMainAdmin(actor)) {
+      res.status(403).json({
+        success: false,
+        message: "Only the Main Admin can demote an admin.",
+      });
+      return;
+    }
+
+    if (isMainAdmin(target)) {
+      res.status(409).json({
+        success: false,
+        message: "The Main Admin cannot be demoted or modified.",
       });
       return;
     }
@@ -292,6 +329,256 @@ export const updateUserRole = async (
     success: true,
     message: `Role updated to ${nextRole}.`,
     data: toUserDto(updated),
+  });
+};
+
+// Domain errors raised inside the transfer transaction. The update aborts;
+// each reason maps to a safe HTTP response. No internal state leaks.
+class AdminTransferError extends Error {
+  readonly reason: string;
+  constructor(reason: string) {
+    super(reason);
+    this.name = "AdminTransferError";
+    this.reason = reason;
+  }
+}
+
+// MongoDB reports missing multi-document transaction support with
+// code 20 (IllegalOperation) or a message about transactions/replica sets.
+// There is deliberately NO non-atomic two-write fallback: without a
+// transaction the transfer simply cannot proceed.
+const isTransactionUnsupportedError = (error: unknown): boolean => {
+  if (typeof error !== "object" || error === null) return false;
+  const code = (error as { code?: unknown }).code;
+  const message = String((error as { message?: unknown }).message ?? "");
+  return code === 20 || /transaction.*(not supported|replica set|mongos)|transaction numbers/i.test(message);
+};
+
+const mapTransferError = (
+  reason: string
+): { status: number; message: string } => {
+  switch (reason) {
+    case "actor-not-main":
+      return { status: 403, message: "Only the Main Admin can transfer ownership." };
+    case "target-not-admin":
+      return { status: 409, message: "Main Admin ownership can only be transferred to an existing Admin." };
+    case "target-already-main":
+      return { status: 409, message: "Target already holds Main Admin ownership." };
+    case "actor-changed":
+    case "target-changed":
+      return { status: 409, message: "The account changed concurrently with the transfer. Refresh and try again." };
+    default:
+      // main-count-N / post-count-N — should be impossible; fail visibly.
+      return { status: 409, message: "Main Admin designation is inconsistent. Please contact support." };
+  }
+};
+
+// POST /api/admin/main-admin/transfer — Main Admin hands ownership to another
+// existing Normal Admin. Requires the current Main Admin's password for
+// re-authentication. The swap happens inside a MongoDB transaction; there is
+// no non-atomic fallback, so the platform can never end up with zero or
+// multiple Main Admins. Both accounts keep the admin role; only the
+// isMainAdmin designation moves. Exactly one Main Admin remains.
+export const transferMainAdmin = async (
+  req: AuthenticatedRequest,
+  res: Response
+): Promise<void> => {
+  if (!req.user) {
+    res.status(401).json({ success: false, message: "Authentication token is required." });
+    return;
+  }
+
+  const actorId = parseId(req.user.id);
+
+  if (!actorId) {
+    res.status(401).json({ success: false, message: "Invalid token payload." });
+    return;
+  }
+
+  const parsed = mainAdminTransferSchema.safeParse(req.body ?? {});
+
+  if (!parsed.success) {
+    res.status(400).json({
+      success: false,
+      message: "Validation failed.",
+      errors: issues(parsed.error),
+    });
+    return;
+  }
+
+  const targetId = new ObjectId(parsed.data.targetUserId);
+  const users = getUsersCollection();
+
+  // Actors are resolved fresh from the database — Main Admin designation
+  // never comes from the JWT.
+  const actor = await users.findOne(
+    { _id: actorId },
+    { projection: { role: 1, isMainAdmin: 1 } }
+  );
+
+  if (!actor || actor.role !== "admin") {
+    res.status(403).json({ success: false, message: "Admin access only." });
+    return;
+  }
+
+  if (!isMainAdmin(actor)) {
+    res.status(403).json({ success: false, message: "Only the Main Admin can transfer ownership." });
+    return;
+  }
+
+  if (targetId.equals(actorId)) {
+    res.status(400).json({ success: false, message: "You cannot transfer Main Admin ownership to yourself." });
+    return;
+  }
+
+  const target = await users.findOne(
+    { _id: targetId },
+    { projection: { role: 1, isMainAdmin: 1 } }
+  );
+
+  if (!target) {
+    res.status(404).json({ success: false, message: "Target user not found." });
+    return;
+  }
+
+  if (target.role !== "admin") {
+    res.status(409).json({ success: false, message: "Main Admin ownership can only be transferred to an existing Admin." });
+    return;
+  }
+
+  if (isMainAdmin(target)) {
+    res.status(409).json({ success: false, message: "Target already holds Main Admin ownership." });
+    return;
+  }
+
+  // Re-authentication: verify the current Main Admin's password against
+  // Better Auth's credential account. The password is compared in memory
+  // and never stored, logged or returned.
+  const account = await getDB()
+    .collection(ACCOUNTS_COLLECTION)
+    .findOne({ userId: actorId, providerId: "credential" });
+
+  const storedHash = account && typeof account.password === "string" ? account.password : null;
+
+  if (!storedHash) {
+    res.status(401).json({ success: false, message: "Re-authentication failed. Check your password and try again." });
+    return;
+  }
+
+  const passwordOk = await verifyPassword({ hash: storedHash, password: parsed.data.password });
+
+  if (!passwordOk) {
+    res.status(401).json({ success: false, message: "Re-authentication failed. Check your password and try again." });
+    return;
+  }
+
+  // Multi-document swap: clear the actor's designation, set the target's.
+  // All checks are re-read inside the transaction to close the TOCTOU race,
+  // and the post-condition count invariant (exactly one Main Admin) is
+  // asserted before commit. No audit collection is introduced; the log line
+  // records only the involved ids.
+  const session = mongoClient.startSession();
+
+  try {
+    await session.withTransaction(async () => {
+      // NOTE: MongoDB allows exactly one operation per transaction session at
+      // a time — concurrent operations on one session are rejected with
+      // "Only servers in a sharded cluster can start a new transaction".
+      // All commands inside this transaction run sequentially.
+      const freshActor = await users.findOne(
+        { _id: actorId },
+        { projection: { isMainAdmin: 1 }, session }
+      );
+
+      const freshTarget = await users.findOne(
+        { _id: targetId },
+        { projection: { isMainAdmin: 1, role: 1 }, session }
+      );
+
+      if (!isMainAdmin(freshActor)) {
+        throw new AdminTransferError("actor-not-main");
+      }
+
+      if (!freshTarget || freshTarget.role !== "admin") {
+        throw new AdminTransferError("target-not-admin");
+      }
+
+      if (isMainAdmin(freshTarget)) {
+        throw new AdminTransferError("target-already-main");
+      }
+
+      const existingMainAdmins = await users.countDocuments({ isMainAdmin: true }, { session });
+
+      if (existingMainAdmins !== 1) {
+        throw new AdminTransferError(`main-count-${existingMainAdmins}`);
+      }
+
+      const now = new Date();
+
+      const cleared = await users.findOneAndUpdate(
+        { _id: actorId, isMainAdmin: true },
+        { $unset: { isMainAdmin: "" }, $set: { updatedAt: now } },
+        { returnDocument: "after", session }
+      );
+
+      if (!cleared) {
+        throw new AdminTransferError("actor-changed");
+      }
+
+      const designated = await users.findOneAndUpdate(
+        { _id: targetId, role: "admin", isMainAdmin: { $ne: true } },
+        { $set: { isMainAdmin: true, updatedAt: now } },
+        { returnDocument: "after", session }
+      );
+
+      if (!designated) {
+        throw new AdminTransferError("target-changed");
+      }
+
+      const remainingMainAdmins = await users.countDocuments({ isMainAdmin: true }, { session });
+
+      if (remainingMainAdmins !== 1) {
+        throw new AdminTransferError(`post-count-${remainingMainAdmins}`);
+      }
+    });
+  } catch (error) {
+    if (error instanceof AdminTransferError) {
+      const mapped = mapTransferError(error.reason);
+      res.status(mapped.status).json({ success: false, message: mapped.message });
+      return;
+    }
+
+    if (isTransactionUnsupportedError(error)) {
+      console.error("Main Admin transfer aborted: transactions unsupported by this MongoDB deployment.");
+      res.status(503).json({
+        success: false,
+        message: "Main Admin transfer is not supported in this environment.",
+      });
+      return;
+    }
+
+    console.error(
+      "Main Admin transfer failed:",
+      error instanceof Error ? error.message : "unknown error"
+    );
+    res.status(500).json({
+      success: false,
+      message: "Couldn't transfer Main Admin ownership right now. Please try again.",
+    });
+    return;
+  } finally {
+    await session.endSession();
+  }
+
+  console.log(`[admin] Main Admin ownership transferred from ${actorId.toHexString()} to ${targetId.toHexString()}`);
+
+  res.status(200).json({
+    success: true,
+    message: "Main Admin ownership transferred.",
+    data: {
+      previousMainAdminId: actorId.toHexString(),
+      newMainAdminId: targetId.toHexString(),
+    },
   });
 };
 

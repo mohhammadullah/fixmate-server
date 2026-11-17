@@ -7,6 +7,13 @@
  * removed on completion. Statistics are checked as deltas against a baseline
  * so pre-existing data doesn't invalidate assertions.
  *
+ * Role-promotion coverage: anonymous/customer/technician rejection, admin
+ * promotion of customers and technicians, strict/invalid input, self-change
+ * rejection, profile-endpoint escalation rejection, and the Normal-Admin
+ * demotion ban (including a concurrent cross-demotion race) that keeps at
+ * least one admin on the platform at all times. The Main Admin ownership
+ * rules are covered by scripts/main-admin-test.mjs.
+ *
  * Required env: MONGODB_URI, MONGODB_DB_NAME (from .env).
  * Optional env: BASE_URL, TEST_ORIGIN.
  * Usage: node scripts/admin-dashboard-test.mjs
@@ -23,7 +30,6 @@ if (!process.env.MONGODB_URI || !process.env.MONGODB_DB_NAME) {
 let failures = 0;
 const pass = (msg) => console.log(`  PASS  ${msg}`);
 const fail = (msg) => { failures += 1; console.log(`  FAIL  ${msg}`); };
-const info = (msg) => console.log(`  INFO  ${msg}`);
 const check = (cond, msg) => (cond ? pass(msg) : fail(msg));
 
 const headers = { "content-type": "application/json", origin: process.env.TEST_ORIGIN ?? "http://localhost:3000" };
@@ -81,7 +87,8 @@ const main = async () => {
   const customer = await makeUser(db, "customer");
   const applicant = await makeUser(db, "applicant", "customer", "approved");
   const secondAdmin = await makeUser(db, "admin2", "admin");
-  console.log("throwaway users created: admin, customer, applicant, admin2\n");
+  const roletech = await makeUser(db, "roletech", "technician");
+  console.log("throwaway users created: admin, customer, applicant, admin2, roletech\n");
 
   const baselineRes = await api("/api/admin/dashboard/stats", { headers: auth(admin.token) });
   if (baselineRes.status !== 200) throw new Error(`baseline stats failed: ${baselineRes.status}`);
@@ -183,22 +190,42 @@ const main = async () => {
 
     // --- Role rules ---
     console.log("\n[role updates]");
-    const setAdmin = await api(`/api/admin/users/${customer.userId}/role`, {
-      method: "PATCH", headers: auth(admin.token), body: JSON.stringify({ role: "admin" }),
+    const anonRole = await api(`/api/admin/users/${customer.userId}/role`, {
+      method: "PATCH", headers, body: JSON.stringify({ role: "technician" }),
     });
-    check(setAdmin.status === 400, `promote to admin via endpoint -> ${setAdmin.status} (expected 400)`);
+    check(anonRole.status === 401, `role change without token -> ${anonRole.status} (expected 401)`);
+    const customerRoleChange = await api(`/api/admin/users/${customer.userId}/role`, {
+      method: "PATCH", headers: auth(customer.token), body: JSON.stringify({ role: "technician" }),
+    });
+    check(customerRoleChange.status === 403, `role change as customer -> ${customerRoleChange.status} (expected 403)`);
+    const technicianRoleChange = await api(`/api/admin/users/${customer.userId}/role`, {
+      method: "PATCH", headers: auth(roletech.token), body: JSON.stringify({ role: "customer" }),
+    });
+    check(technicianRoleChange.status === 403, `role change as technician -> ${technicianRoleChange.status} (expected 403)`);
+    const badTarget = await api("/api/admin/users/not-an-id/role", {
+      method: "PATCH", headers: auth(admin.token), body: JSON.stringify({ role: "customer" }),
+    });
+    check(badTarget.status === 400, `role change with invalid id -> ${badTarget.status} (expected 400)`);
+    const missingTarget = await api(`/api/admin/users/${new ObjectId().toHexString()}/role`, {
+      method: "PATCH", headers: auth(admin.token), body: JSON.stringify({ role: "customer" }),
+    });
+    check(missingTarget.status === 404, `role change for missing user -> ${missingTarget.status} (expected 404)`);
+    const profileEscalation = await api("/api/users/me", {
+      method: "PATCH", headers: auth(applicant.token), body: JSON.stringify({ role: "admin" }),
+    });
+    check(profileEscalation.status === 400, `profile endpoint cannot escalate role -> ${profileEscalation.status} (expected 400)`);
     const selfDemote = await api(`/api/admin/users/${admin.userId}/role`, {
       method: "PATCH", headers: auth(admin.token), body: JSON.stringify({ role: "customer" }),
     });
     check(selfDemote.status === 403, `self role change -> ${selfDemote.status} (expected 403)`);
-    const unapprovedPromote = await api(`/api/admin/users/${customer.userId}/role`, {
-      method: "PATCH", headers: auth(admin.token), body: JSON.stringify({ role: "technician" }),
-    });
-    check(unapprovedPromote.status === 409, `promote unapproved customer -> ${unapprovedPromote.status} (expected 409)`);
     const badRoleBody = await api(`/api/admin/users/${customer.userId}/role`, {
       method: "PATCH", headers: auth(admin.token), body: JSON.stringify({ role: "admin", extra: true }),
     });
     check(badRoleBody.status === 400, `strict role body -> ${badRoleBody.status} (expected 400)`);
+    const unapprovedPromote = await api(`/api/admin/users/${customer.userId}/role`, {
+      method: "PATCH", headers: auth(admin.token), body: JSON.stringify({ role: "technician" }),
+    });
+    check(unapprovedPromote.status === 409, `promote unapproved customer -> ${unapprovedPromote.status} (expected 409)`);
     const promote = await api(`/api/admin/users/${applicant.userId}/role`, {
       method: "PATCH", headers: auth(admin.token), body: JSON.stringify({ role: "technician" }),
     });
@@ -207,19 +234,61 @@ const main = async () => {
       method: "PATCH", headers: auth(admin.token), body: JSON.stringify({ role: "technician" }),
     });
     check(sameRole.status === 409, `repeat role -> ${sameRole.status} (expected 409)`);
+
+    // --- Admin promotion ---
+    console.log("\n[admin promotion]");
+    const promoteCustomerToAdmin = await api(`/api/admin/users/${customer.userId}/role`, {
+      method: "PATCH", headers: auth(admin.token), body: JSON.stringify({ role: "admin" }),
+    });
+    check(promoteCustomerToAdmin.status === 200 && promoteCustomerToAdmin.body?.data?.role === "admin", `admin promotes customer -> ${promoteCustomerToAdmin.status} (expected 200)`);
+    const promoteTechToAdmin = await api(`/api/admin/users/${applicant.userId}/role`, {
+      method: "PATCH", headers: auth(admin.token), body: JSON.stringify({ role: "admin" }),
+    });
+    check(promoteTechToAdmin.status === 200 && promoteTechToAdmin.body?.data?.role === "admin", `admin promotes technician -> ${promoteTechToAdmin.status} (expected 200)`);
+
+    // --- Admin demotion hierarchy (Normal Admins can never demote) ---
+    console.log("\n[admin demotion hierarchy]");
     const demoteSecondAdmin = await api(`/api/admin/users/${secondAdmin.userId}/role`, {
       method: "PATCH", headers: auth(admin.token), body: JSON.stringify({ role: "customer" }),
     });
-    check(demoteSecondAdmin.status === 200, `demote second admin while others exist -> ${demoteSecondAdmin.status}`);
-    const remainingAdmins = await users.countDocuments({ role: "admin" });
-    if (remainingAdmins === 1) {
-      const lastAdmin = await api(`/api/admin/users/${admin.userId}/role`, {
-        method: "PATCH", headers: auth(secondAdmin.token), body: JSON.stringify({ role: "customer" }),
-      });
-      check(lastAdmin.status === 409, `demote last admin -> ${lastAdmin.status} (expected 409)`);
-    } else {
-      info(`skipped last-admin test: ${remainingAdmins} admins remain in database`);
-    }
+    check(demoteSecondAdmin.status === 403, `normal admin demotes second admin -> ${demoteSecondAdmin.status} (expected 403)`);
+    const demotePromotedCustomer = await api(`/api/admin/users/${customer.userId}/role`, {
+      method: "PATCH", headers: auth(admin.token), body: JSON.stringify({ role: "customer" }),
+    });
+    check(demotePromotedCustomer.status === 403, `normal admin demotes promoted admin -> ${demotePromotedCustomer.status} (expected 403)`);
+    const demotePromotedTech = await api(`/api/admin/users/${applicant.userId}/role`, {
+      method: "PATCH", headers: auth(admin.token), body: JSON.stringify({ role: "customer" }),
+    });
+    check(demotePromotedTech.status === 403, `normal admin demotes promoted admin -> ${demotePromotedTech.status} (expected 403)`);
+    const repeatAdminPromotion = await api(`/api/admin/users/${applicant.userId}/role`, {
+      method: "PATCH", headers: auth(admin.token), body: JSON.stringify({ role: "admin" }),
+    });
+    check(repeatAdminPromotion.status === 409, `repeat admin promotion -> ${repeatAdminPromotion.status} (expected 409)`);
+
+    // Cross-demotion race: two admins demote each other at once. Normal
+    // Admins can never demote admins, so both requests get 403 — no admin
+    // can ever be removed by a non-Main-Admin, whatever the count.
+    const raceSignin = await api("/api/auth/sign-in/email", {
+      method: "POST", headers, body: JSON.stringify({ email: customer.email, password: customer.password }),
+    });
+    const raceCookie = (raceSignin.headers.getSetCookie?.() ?? []).find((c) => c.includes("session_token"))?.split(";")[0];
+    const raceTokenRes = await api("/api/auth/token", { headers: { cookie: raceCookie } });
+    const customerAdminToken = raceTokenRes.body?.token;
+    if (!customerAdminToken) throw new Error("could not obtain admin token for race test");
+    const [demoteA, demoteB] = await Promise.all([
+      api(`/api/admin/users/${customer.userId}/role`, {
+        method: "PATCH", headers: auth(admin.token), body: JSON.stringify({ role: "customer" }),
+      }),
+      api(`/api/admin/users/${admin.userId}/role`, {
+        method: "PATCH", headers: auth(customerAdminToken), body: JSON.stringify({ role: "customer" }),
+      }),
+    ]);
+    check(demoteA.status === 403 && demoteB.status === 403, `cross-demotion rejected for normal admins -> ${demoteA.status}/${demoteB.status} (expected 403/403)`);
+    check(demoteA.status !== 500 && demoteB.status !== 500, "cross-demotion did not error out");
+    const adminsLeft = await users.countDocuments({ role: "admin" });
+    check(adminsLeft >= 4, `all four throwaway admins remain after the race (got ${adminsLeft})`);
+    const actorStillAdmin = await users.findOne({ _id: admin.userId }, { projection: { role: 1 } });
+    check(actorStillAdmin?.role === "admin", "actor remains admin after the race");
 
     // --- All bookings ---
     console.log("\n[all bookings]");
@@ -239,9 +308,9 @@ const main = async () => {
     const searchBookings = await api(`/api/admin/bookings?search=${encodeURIComponent("Seeded Admin Test Repair")}&limit=50`, { headers: auth(admin.token) });
     check(searchBookings.status === 200 && searchBookings.body?.data?.some((b) => b.serviceTitle === "Seeded Admin Test Repair"), "booking search works");
   } finally {
-    await users.deleteMany({ _id: { $in: [admin.userId, customer.userId, applicant.userId, secondAdmin.userId] } });
-    await db.collection("session").deleteMany({ userId: { $in: [admin.userId, customer.userId, applicant.userId, secondAdmin.userId].map(String) } });
-    await db.collection("account").deleteMany({ userId: { $in: [admin.userId, customer.userId, applicant.userId, secondAdmin.userId].map(String) } });
+    await users.deleteMany({ _id: { $in: [admin.userId, customer.userId, applicant.userId, secondAdmin.userId, roletech.userId] } });
+    await db.collection("session").deleteMany({ userId: { $in: [admin.userId, customer.userId, applicant.userId, secondAdmin.userId, roletech.userId].map(String) } });
+    await db.collection("account").deleteMany({ userId: { $in: [admin.userId, customer.userId, applicant.userId, secondAdmin.userId, roletech.userId].map(String) } });
     await services.deleteMany({ _id: { $in: serviceIds } });
     await bookings.deleteMany({ _id: { $in: bookingIds } });
     console.log("\ncleanup: throwaway users, services and bookings removed");

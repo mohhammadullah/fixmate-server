@@ -1,9 +1,16 @@
 /**
  * One-time, server-side admin bootstrap (development / deployment utility).
  *
- * Promotes an EXISTING Better Auth user (by exact email) to the admin role.
- * It never creates users, never accepts a password, and is never exposed
- * through an HTTP endpoint. Public signup always assigns "customer".
+ * Promotes an EXISTING Better Auth user (by exact email) to the admin role
+ * and, if no Main Admin is designated yet, designates that user as the
+ * Main Admin. It never creates users, never accepts a password, and is never
+ * exposed through an HTTP endpoint. Public signup always assigns "customer".
+ *
+ * Recovery mode — designate an EXISTING Admin as Main Admin when no Main
+ * Admin exists (e.g. the designated admin was lost):
+ *   ADMIN_BOOTSTRAP_DESIGNATE_MAIN=true ADMIN_BOOTSTRAP_EMAIL=<existing admin email>
+ *   ADMIN_BOOTSTRAP_CONFIRM=true
+ * Refuses to run if a Main Admin already exists.
  *
  * Required env:
  *   ADMIN_BOOTSTRAP_EMAIL=<exact existing user email>
@@ -20,6 +27,7 @@ import { MongoClient } from "mongodb";
 
 const EMAIL = process.env.ADMIN_BOOTSTRAP_EMAIL;
 const CONFIRM = process.env.ADMIN_BOOTSTRAP_CONFIRM;
+const DESIGNATE_MAIN = process.env.ADMIN_BOOTSTRAP_DESIGNATE_MAIN === "true";
 
 if (!EMAIL || EMAIL.trim() === "") {
   console.error("ADMIN_BOOTSTRAP_EMAIL must be set to the exact email of an existing user.");
@@ -55,8 +63,54 @@ const main = async () => {
   }
 
   const target = matches[0];
+
+  // --- Designation recovery mode: an EXISTING admin becomes the Main Admin
+  if (DESIGNATE_MAIN) {
+    if (target.role !== "admin") {
+      console.error(
+        `Refusing to run: user "${EMAIL}" has role "${target.role}", expected "admin".`
+      );
+      process.exit(1);
+    }
+    const mainCount = await users.countDocuments({ isMainAdmin: true });
+    if (mainCount > 0) {
+      console.error(
+        "Refusing to run: a Main Admin already exists. Use POST /api/admin/main-admin/transfer to hand ownership over."
+      );
+      process.exit(1);
+    }
+    const result = await users.updateOne(
+      { _id: target._id, role: "admin", isMainAdmin: { $ne: true } },
+      { $set: { isMainAdmin: true, updatedAt: new Date() } }
+    );
+    if (result.modifiedCount !== 1) {
+      console.error("Failed to designate Main Admin (concurrent modification?). No changes made.");
+      process.exit(1);
+    }
+    console.log(`Designated existing admin "${EMAIL}" as Main Admin.`);
+    console.log("DONE. Remove ADMIN_BOOTSTRAP_DESIGNATE_MAIN from the environment.");
+    await client.close();
+    process.exit(0);
+  }
+
+  // --- Initial promotion (+ Main Admin designation if none exists) ---
   if (target.role === "admin") {
-    console.error(`Refusing to run: user "${EMAIL}" is already an admin (bootstrap is one-time).`);
+    const mainCount = await users.countDocuments({ isMainAdmin: true });
+    if (mainCount === 0) {
+      const result = await users.updateOne(
+        { _id: target._id, role: "admin", isMainAdmin: { $ne: true } },
+        { $set: { isMainAdmin: true, updatedAt: new Date() } }
+      );
+      if (result.modifiedCount !== 1) {
+        console.error("Failed to designate Main Admin. No changes made.");
+        process.exit(1);
+      }
+      console.log(`Designated existing admin "${EMAIL}" as Main Admin (no Main Admin existed).`);
+      console.log("DONE. Remove ADMIN_BOOTSTRAP_* from the environment.");
+      await client.close();
+      process.exit(0);
+    }
+    console.error(`Refusing to run: user "${EMAIL}" is already an admin.`);
     process.exit(1);
   }
   if (target.role !== "customer") {
@@ -67,7 +121,7 @@ const main = async () => {
   }
 
   const result = await users.updateOne({ _id: target._id, role: "customer" }, {
-    $set: { role: "admin" },
+    $set: { role: "admin", updatedAt: new Date() },
   });
 
   if (result.modifiedCount !== 1) {
@@ -76,6 +130,28 @@ const main = async () => {
   }
 
   console.log(`Promoted existing user "${EMAIL}" to admin.`);
+
+  // Designate Main Admin if none exists yet. Only the first designated
+  // admin becomes Main Admin; later bootstrap runs promote normal admins
+  // only (this path is for the initial hierarchy).
+  const mainCount = await users.countDocuments({ isMainAdmin: true });
+
+  if (mainCount === 0) {
+    const designated = await users.updateOne(
+      { _id: target._id, role: "admin", isMainAdmin: { $ne: true } },
+      { $set: { isMainAdmin: true, updatedAt: new Date() } }
+    );
+    if (designated.modifiedCount !== 1) {
+      // Promotion succeeded but designation must not silently fail.
+      console.warn(
+        "WARNING: promoted to admin, but designating Main Admin failed. Re-run with ADMIN_BOOTSTRAP_DESIGNATE_MAIN=true to designate."
+      );
+    } else {
+      console.log(`Designated "${EMAIL}" as Main Admin (no Main Admin existed).`);
+    }
+  } else {
+    console.log("A Main Admin is already designated — designation left unchanged.");
+  }
   console.log(
     "DONE. Remove ADMIN_BOOTSTRAP_EMAIL and ADMIN_BOOTSTRAP_CONFIRM from the environment, then restart the server."
   );
