@@ -28,10 +28,10 @@ export const createBookingSchema = z.strictObject({
 export type CreateBookingInput = z.input<typeof createBookingSchema>;
 export type CreateBookingData = z.infer<typeof createBookingSchema>;
 
-// Technician booking-list query. Unknown query keys (including any
-// technicianId) are stripped — never trusted. Empty strings are rejected.
-// Chosen behavior: a limit above 50 is rejected with HTTP 400 rather than
-// silently capped.
+// Booking-list query shared by the technician and customer list endpoints.
+// Unknown query keys (including any technicianId/customerId) are stripped —
+// never trusted. Empty strings are rejected. Chosen behavior: a limit above
+// 50 is rejected with HTTP 400 rather than silently capped.
 const positiveIntQuerySchema = (label: string, max?: number) => {
   const base = z
     .string({ error: `${label} must be a string` })
@@ -50,7 +50,7 @@ const positiveIntQuerySchema = (label: string, max?: number) => {
   ).optional();
 };
 
-export const listTechnicianBookingsQuerySchema = z.object({
+export const listBookingsQuerySchema = z.object({
   status: z
     .enum(BOOKING_STATUSES, {
       error: `Status must be one of: ${BOOKING_STATUSES.join(", ")}`,
@@ -83,7 +83,15 @@ export const updateBookingStatusSchema = z.discriminatedUnion("status", [
   }),
 ]);
 
-export type ListTechnicianBookingsQueryInput = z.input<typeof listTechnicianBookingsQuerySchema>;
-export type ListTechnicianBookingsQueryData = z.infer<typeof listTechnicianBookingsQuerySchema>;
+export type ListBookingsQueryInput = z.input<typeof listBookingsQuerySchema>;
+export type ListBookingsQueryData = z.infer<typeof listBookingsQuerySchema>;
+// Customer cancellation takes no input at all: the booking is identified by
+// the route param and the customer by the verified JWT. An empty strict
+// object rejects any client-supplied body fields (consistent with the
+// strict-object convention used elsewhere). Use via
+// cancelBookingSchema.safeParse(req.body ?? {}).
+export const cancelBookingSchema = z.strictObject({});
+
+export type CancelBookingInput = z.input<typeof cancelBookingSchema>;
 export type UpdateBookingStatusInput = z.input<typeof updateBookingStatusSchema>;
 export type UpdateBookingStatusData = z.infer<typeof updateBookingStatusSchema>;

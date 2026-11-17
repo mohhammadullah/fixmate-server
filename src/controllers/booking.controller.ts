@@ -3,7 +3,7 @@ import type { Response } from "express";
 import { ObjectId, type Filter, type Sort } from "mongodb";
 import { getDB } from "../config/db.js";
 import type { AuthenticatedRequest } from "../middleware/verifyToken.js";
-import { createBookingSchema, listTechnicianBookingsQuerySchema, updateBookingStatusSchema, OBJECT_ID_HEX_REGEX } from "../validators/booking.validator.js";
+import { createBookingSchema, listBookingsQuerySchema, updateBookingStatusSchema, cancelBookingSchema, OBJECT_ID_HEX_REGEX } from "../validators/booking.validator.js";
 import {
   getBookingsCollection,
   ACTIVE_BOOKING_STATUSES,
@@ -47,10 +47,10 @@ const parseParamId = (raw: unknown): ObjectId | null => {
   return new ObjectId(id);
 };
 
-// Technician identity comes exclusively from the verified JWT; a missing
-// JWT payload is rejected here as defense-in-depth (the route middleware
-// already enforces it).
-const resolveTechnicianId = (
+// Identity comes exclusively from the verified JWT; a missing JWT payload
+// is rejected here as defense-in-depth (the route middleware already
+// enforces it). Shared by technician and customer endpoints.
+const resolveAuthUserId = (
   req: AuthenticatedRequest
 ): ObjectId | null => {
   if (!req.user || !ObjectId.isValid(req.user.id)) {
@@ -59,7 +59,9 @@ const resolveTechnicianId = (
   return new ObjectId(req.user.id);
 };
 
-const TECHNICIAN_SORT: Sort = { createdAt: -1, _id: -1 };
+const resolveTechnicianId = resolveAuthUserId;
+
+const BOOKING_SORT: Sort = { createdAt: -1, _id: -1 };
 
 // POST /api/bookings — customer only (verifyToken -> verifyCustomer).
 // Identity is taken exclusively from the verified JWT and the server-side
@@ -257,7 +259,7 @@ export const listTechnicianBookings = async (
     return;
   }
 
-  const parsed = listTechnicianBookingsQuerySchema.safeParse(req.query);
+  const parsed = listBookingsQuerySchema.safeParse(req.query);
 
   if (!parsed.success) {
     res.status(400).json({
@@ -287,7 +289,7 @@ export const listTechnicianBookings = async (
   const [items, totalItems] = await Promise.all([
     getBookingsCollection()
       .find(filter)
-      .sort(TECHNICIAN_SORT)
+      .sort(BOOKING_SORT)
       .skip((page - 1) * limit)
       .limit(limit)
       .toArray(),
@@ -310,20 +312,29 @@ export const listTechnicianBookings = async (
   });
 };
 
-// Shared tail for the accept/reject transition helpers: after an atomic
-// update fails to match, distinguish "booking not found / not owned by this
-// technician" (404) from "owned but not in the requested state" (409). The
-// lookup is scoped to {_id, technicianId} so another technician's booking
-// is indistinguishable from a missing one.
+// Shared tail for the accept/reject/cancel transition helpers: after an
+// atomic update fails to match, distinguish "booking not found / not owned
+// by this caller" (404) from "owned but not in the expected state" (409).
+// The lookup is scoped by the caller's ownership field so another user's
+// booking is indistinguishable from a missing one.
 const respondAfterFailedTransition = async (
   res: Response,
   bookingId: ObjectId,
-  technicianId: ObjectId
+  ownerFilter: { technicianId?: ObjectId; customerId?: ObjectId }
 ): Promise<void> => {
-  const existing = await getBookingsCollection().findOne(
-    { _id: bookingId, technicianId },
-    { projection: { _id: 1 } }
-  );
+  const lookup: Filter<Booking> = { _id: bookingId };
+
+  if (ownerFilter.technicianId) {
+    lookup.technicianId = ownerFilter.technicianId;
+  }
+
+  if (ownerFilter.customerId) {
+    lookup.customerId = ownerFilter.customerId;
+  }
+
+  const existing = await getBookingsCollection().findOne(lookup, {
+    projection: { _id: 1 },
+  });
 
   if (!existing) {
     res.status(404).json({
@@ -387,7 +398,7 @@ const transitionRequestedBooking = async (
   );
 
   if (!updated) {
-    await respondAfterFailedTransition(res, bookingId, technicianId);
+    await respondAfterFailedTransition(res, bookingId, { technicianId });
     return;
   }
 
@@ -510,13 +521,166 @@ export const updateBookingStatus = async (
   );
 
   if (!updated) {
-    await respondAfterFailedTransition(res, bookingId, technicianId);
+    await respondAfterFailedTransition(res, bookingId, { technicianId });
     return;
   }
 
   res.status(200).json({
     success: true,
     message: transition.message,
+    data: updated,
+  });
+};
+
+// GET /api/bookings/my — customer only (verifyToken -> verifyCustomer).
+// Returns only bookings whose customerId matches the verified JWT; any
+// customerId in the query string is stripped by the schema and ignored.
+// Same filtering/pagination/metadata convention as the technician list.
+export const listMyBookings = async (
+  req: AuthenticatedRequest,
+  res: Response
+): Promise<void> => {
+  if (!req.user) {
+    res.status(401).json({
+      success: false,
+      message: "Authentication token is required.",
+    });
+    return;
+  }
+
+  const customerId = resolveAuthUserId(req);
+
+  if (!customerId) {
+    res.status(401).json({
+      success: false,
+      message: "Invalid token payload.",
+    });
+    return;
+  }
+
+  const parsed = listBookingsQuerySchema.safeParse(req.query);
+
+  if (!parsed.success) {
+    res.status(400).json({
+      success: false,
+      message: "Validation failed.",
+      errors: parsed.error.issues.map((issue) => ({
+        field: issue.path.join("."),
+        message: issue.message,
+      })),
+    });
+    return;
+  }
+
+  const { status } = parsed.data;
+  const page = parsed.data.page ?? 1;
+  // Chosen behavior: limit above 50 is rejected by the schema with 400.
+  const limit = parsed.data.limit ?? 12;
+
+  const filter: Filter<Booking> = { customerId };
+
+  if (status) {
+    filter.status = status;
+  }
+
+  // MongoDB errors propagate to Express 5, which forwards them to the
+  // existing errorHandler middleware.
+  const [items, totalItems] = await Promise.all([
+    getBookingsCollection()
+      .find(filter)
+      .sort(BOOKING_SORT)
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .toArray(),
+    getBookingsCollection().countDocuments(filter),
+  ]);
+
+  const totalPages = totalItems === 0 ? 0 : Math.ceil(totalItems / limit);
+
+  res.status(200).json({
+    success: true,
+    data: items,
+    pagination: {
+      currentPage: page,
+      limit,
+      totalItems,
+      totalPages,
+      hasNextPage: page < totalPages,
+      hasPrevPage: page > 1,
+    },
+  });
+};
+
+// PATCH /api/bookings/:id/cancel — customer only (verifyToken -> verifyCustomer).
+// Atomically moves the customer's own booking from "requested" to
+// "cancelled". No body fields are accepted. The {_id, customerId,
+// status: "requested"} filter is the only transition guard; the second
+// lookup only distinguishes 404 from 409 and never authorizes a write.
+export const cancelBooking = async (
+  req: AuthenticatedRequest,
+  res: Response
+): Promise<void> => {
+  if (!req.user) {
+    res.status(401).json({
+      success: false,
+      message: "Authentication token is required.",
+    });
+    return;
+  }
+
+  const customerId = resolveAuthUserId(req);
+
+  if (!customerId) {
+    res.status(401).json({
+      success: false,
+      message: "Invalid token payload.",
+    });
+    return;
+  }
+
+  const { id } = req.params;
+  const bookingId = parseParamId(id);
+
+  if (!bookingId) {
+    res.status(400).json({
+      success: false,
+      message: "Invalid booking id.",
+    });
+    return;
+  }
+
+  // Cancellation accepts no client input at all; any body fields are
+  // rejected (consistent with the strict-object convention).
+  const parsed = cancelBookingSchema.safeParse(req.body ?? {});
+
+  if (!parsed.success) {
+    res.status(400).json({
+      success: false,
+      message: "Validation failed.",
+      errors: parsed.error.issues.map((issue) => ({
+        field: issue.path.join("."),
+        message: issue.message,
+      })),
+    });
+    return;
+  }
+
+  // MongoDB errors propagate to Express 5, which forwards them to the
+  // existing errorHandler middleware.
+  const updated = await getBookingsCollection().findOneAndUpdate(
+    { _id: bookingId, customerId, status: "requested" },
+    { $set: { status: "cancelled", updatedAt: new Date() } },
+    { returnDocument: "after" }
+  );
+
+  if (!updated) {
+    await respondAfterFailedTransition(res, bookingId, { customerId });
+    return;
+  }
+
+  res.status(200).json({
+    success: true,
+    message: "Booking cancelled successfully.",
     data: updated,
   });
 };
