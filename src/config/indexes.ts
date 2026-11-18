@@ -113,6 +113,17 @@ export const paymentIndexes: IndexDescription[] = [
     key: { createdAt: -1 },
     name: "payments_createdAt_-1",
   },
+  // Supports the technician payments view: per-booking payment lookups
+  // (including failed/expired records, which the partial indexes cannot
+  // serve) and the per-currency settled-money aggregation by technician.
+  {
+    key: { bookingId: 1 },
+    name: "payments_bookingId_1",
+  },
+  {
+    key: { technicianId: 1, status: 1 },
+    name: "payments_technicianId_1_status_1",
+  },
 ];
 
 // Index on the `user` collection supporting admin application listings.

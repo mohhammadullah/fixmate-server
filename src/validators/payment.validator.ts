@@ -42,6 +42,23 @@ export const checkoutSessionSchema = z.strictObject({
     ),
 });
 
+// Technician payment-history query. `status=paid|unpaid` splits the two
+// buckets the technician view cares about; omitted returns both. Chosen
+// behavior (consistent with the other list endpoints): limit defaults to
+// 10 and a limit above 50 is rejected with HTTP 400.
+export const listTechnicianPaymentsQuerySchema = z.object({
+  page: positiveIntQuerySchema("page"),
+  limit: positiveIntQuerySchema("limit", 50),
+  status: z.enum(["paid", "unpaid"]).optional(),
+});
+
+export type ListTechnicianPaymentsQueryInput = z.input<
+  typeof listTechnicianPaymentsQuerySchema
+>;
+export type ListTechnicianPaymentsQueryData = z.infer<
+  typeof listTechnicianPaymentsQuerySchema
+>;
+
 export type CheckoutSessionInput = z.input<typeof checkoutSessionSchema>;
 export type CheckoutSessionData = z.infer<typeof checkoutSessionSchema>;
 

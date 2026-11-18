@@ -12,10 +12,12 @@ import type { AuthenticatedRequest } from "../middleware/verifyToken.js";
 import {
   checkoutSessionSchema,
   listMyPaymentsQuerySchema,
+  listTechnicianPaymentsQuerySchema,
 } from "../validators/payment.validator.js";
-import { getBookingsCollection } from "../models/booking.model.js";
+import { getBookingsCollection, type Booking } from "../models/booking.model.js";
 import {
   getPaymentsCollection,
+  PAYMENTS_COLLECTION,
   type Payment,
   type PaymentStatus,
 } from "../models/payment.model.js";
@@ -498,6 +500,335 @@ export const listMyPayments = async (
   res.status(200).json({
     success: true,
     data: items.map(toPaymentDTO),
+    pagination: {
+      currentPage: page,
+      limit,
+      totalItems,
+      totalPages,
+      hasNextPage: page < totalPages,
+      hasPrevPage: page > 1,
+    },
+  });
+};
+
+// Safe technician payment-history entry. One entry per completed booking
+// owned by the authenticated technician — payment records describe money
+// that actually moved; completed-but-unpaid bookings are shown alongside
+// so the technician can tell settled from outstanding amounts. Stripe
+// internals beyond the Checkout Session id (an identifier, not a secret,
+// same convention as the admin payments view), and everything else about
+// the customer's account, are deliberately excluded. `amount` is in major
+// currency units.
+interface TechnicianPaymentEntryDTO {
+  bookingId: string;
+  serviceTitle: string;
+  customerName: string | null;
+  amount: number;
+  amountMinor: number;
+  currency: string;
+  status: "paid" | "unpaid";
+  reference: string | null;
+  completedAt: Date;
+  paidAt: Date | null;
+}
+
+const stringOrNull = (value: unknown): string | null =>
+  typeof value === "string" && value.length > 0 ? value : null;
+
+const BOOKING_TECHNICIAN_SORT: Sort = { updatedAt: -1, _id: -1 };
+
+// Aggregation row for per-currency grouping (minor units for payments;
+// major units for booking finalAmount sums, converted where merged).
+interface CurrencyMinorBucket {
+  _id: string;
+  total: number;
+  count: number;
+}
+
+interface CurrencyMajorBucket {
+  _id: null;
+  total: number;
+  count: number;
+}
+
+// GET /api/payments/technician — technician only (verifyToken ->
+// verifyTechnician). Returns one entry per completed booking owned by the
+// authenticated technician, newest activity first (for paid bookings the
+// Stripe webhook sets booking.updatedAt to the paid time). Paid vs.
+// unpaid is decided from the server-side booking.paymentStatus; payment
+// records supply reference, currency and paidAt.
+//
+// Ownership is enforced exclusively through the JWT-resolved technicianId
+// (and the verifyToken database role check); any technicianId in the
+// query string is stripped by the schema and ignored.
+//
+// The summary is computed across the full scoped dataset (identically to
+// the visible list, WITHOUT the status filter) directly in MongoDB —
+// documents are never loaded into memory in bulk. Amounts are kept per
+// currency: summing different currencies into one number would be
+// meaningless. Paid entries are settled money from the payments
+// collection (unique per booking); unpaid entries contribute the booking
+// finalAmount once each, so the two buckets never double-count.
+export const listTechnicianPayments = async (
+  req: AuthenticatedRequest,
+  res: Response
+): Promise<void> => {
+  if (!req.user) {
+    res.status(401).json({
+      success: false,
+      message: "Authentication token is required.",
+    });
+    return;
+  }
+
+  const technicianId = resolveAuthUserId(req);
+
+  if (!technicianId) {
+    res.status(401).json({
+      success: false,
+      message: "Invalid token payload.",
+    });
+    return;
+  }
+
+  const parsed = listTechnicianPaymentsQuerySchema.safeParse(req.query);
+
+  if (!parsed.success) {
+    res.status(400).json({
+      success: false,
+      message: "Validation failed.",
+      errors: parsed.error.issues.map((issue) => ({
+        field: issue.path.join("."),
+        message: issue.message,
+      })),
+    });
+    return;
+  }
+
+  const page = parsed.data.page ?? 1;
+  // Chosen behavior (consistent with the other list endpoints): limit
+  // above 50 is rejected with HTTP 400.
+  const limit = parsed.data.limit ?? 10;
+  const status = parsed.data.status;
+
+  // Base scope: completed bookings snapshotted to this technician.
+  // "refunded" (if it is ever set outside the payment flow) is treated
+  // as unpaid — money was not settled to the technician for it.
+  const baseFilter: Filter<Booking> = { technicianId, status: "completed" };
+  const listFilter: Filter<Booking> =
+    status === "paid"
+      ? { ...baseFilter, paymentStatus: "paid" }
+      : status === "unpaid"
+        ? { ...baseFilter, paymentStatus: { $ne: "paid" } }
+        : baseFilter;
+
+  // MongoDB errors propagate to Express 5, which forwards them to the
+  // existing errorHandler middleware.
+  const [items, totalItems] = await Promise.all([
+    getBookingsCollection()
+      .find(listFilter, {
+        projection: {
+          serviceTitle: 1,
+          customerName: 1,
+          paymentStatus: 1,
+          finalAmount: 1,
+          updatedAt: 1,
+        },
+      })
+      .sort(BOOKING_TECHNICIAN_SORT)
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .toArray(),
+    getBookingsCollection().countDocuments(listFilter),
+  ]);
+
+  // Fetch payment records only for the page slice — never the whole set.
+  const bookingIds = items.map((booking) => booking._id);
+  const paymentDocs = bookingIds.length
+    ? await getPaymentsCollection()
+        .find(
+          { bookingId: { $in: bookingIds } },
+          {
+            projection: {
+              bookingId: 1,
+              status: 1,
+              amount: 1,
+              currency: 1,
+              paidAt: 1,
+              stripeSessionId: 1,
+            },
+          }
+        )
+        .toArray()
+    : [];
+
+  const paymentsByBookingId = new Map<
+    string,
+    { succeeded?: Payment; pending?: Payment }
+  >();
+  for (const payment of paymentDocs) {
+    const key = payment.bookingId.toHexString();
+    const slot = paymentsByBookingId.get(key) ?? {};
+    if (payment.status === "succeeded") {
+      slot.succeeded = payment;
+    } else if (payment.status === "pending") {
+      slot.pending = payment;
+    }
+    paymentsByBookingId.set(key, slot);
+  }
+
+  const entries: TechnicianPaymentEntryDTO[] = items.map((booking) => {
+    const paid = booking.paymentStatus === "paid";
+    const slot = paymentsByBookingId.get(booking._id.toHexString());
+    const succeeded = slot?.succeeded;
+    const pending = slot?.pending;
+    const reference = succeeded ?? pending;
+    const currency =
+      stringOrNull(reference?.currency)?.toLowerCase() ?? stripeCurrency;
+    const finalAmount =
+      typeof booking.finalAmount === "number" &&
+      Number.isFinite(booking.finalAmount) &&
+      booking.finalAmount >= 0
+        ? booking.finalAmount
+        : 0;
+    // Settled money always comes from the payment record (unique per
+    // booking); the booking snapshot is only a fallback for inconsistent
+    // datasets. Unpaid amounts are the booking's final charge estimate.
+    const amountMinor = paid
+      ? succeeded?.amount ?? toMinorUnits(finalAmount, currency)
+      : pending?.amount ?? toMinorUnits(finalAmount, currency);
+
+    return {
+      bookingId: booking._id.toHexString(),
+      serviceTitle: booking.serviceTitle,
+      customerName: stringOrNull(booking.customerName),
+      amount: fromMinorUnits(amountMinor, currency),
+      amountMinor,
+      currency,
+      status: paid ? "paid" : "unpaid",
+      reference: paid ? stringOrNull(succeeded?.stripeSessionId) : null,
+      completedAt: booking.updatedAt,
+      paidAt: paid ? succeeded?.paidAt ?? null : null,
+    };
+  });
+
+  const [completedBookings, paidBookings, succeededRows, anomalyRows, unpaidAgg] =
+    await Promise.all([
+      getBookingsCollection().countDocuments(baseFilter),
+      getBookingsCollection().countDocuments({
+        ...baseFilter,
+        paymentStatus: "paid",
+      }),
+      // Settled money, grouped per currency (minor units).
+      getPaymentsCollection()
+        .aggregate<CurrencyMinorBucket>([
+          { $match: { technicianId, status: "succeeded" as PaymentStatus } },
+          {
+            $group: {
+              _id: "$currency",
+              total: { $sum: "$amount" },
+              count: { $sum: 1 },
+            },
+          },
+        ])
+        .toArray(),
+      // Anomaly guard: bookings marked paid with NO succeeded payment
+      // would otherwise vanish from the totals. Add their finalAmount
+      // once each — never double-counted, because succeededRows covers
+      // only bookings that HAVE one.
+      getBookingsCollection()
+        .aggregate<CurrencyMajorBucket>([
+          { $match: { ...baseFilter, paymentStatus: "paid" } },
+          {
+            $lookup: {
+              from: PAYMENTS_COLLECTION,
+              let: { bookingId: "$_id" },
+              pipeline: [
+                {
+                  $match: {
+                    $expr: {
+                      $and: [
+                        { $eq: ["$bookingId", "$$bookingId"] },
+                        { $eq: ["$status", "succeeded"] },
+                      ],
+                    },
+                  },
+                },
+              ],
+              as: "settled",
+            },
+          },
+          { $match: { settled: { $size: 0 } } },
+          {
+            $group: {
+              _id: null,
+              total: { $sum: { $ifNull: ["$finalAmount", 0] } },
+              count: { $sum: 1 },
+            },
+          },
+        ])
+        .toArray(),
+      // Unpaid outstanding, summed once per booking.
+      getBookingsCollection()
+        .aggregate<CurrencyMajorBucket>([
+          { $match: { ...baseFilter, paymentStatus: { $ne: "paid" } } },
+          {
+            $group: {
+              _id: null,
+              total: { $sum: { $ifNull: ["$finalAmount", 0] } },
+              count: { $sum: 1 },
+            },
+          },
+        ])
+        .toArray(),
+    ]);
+
+  const paidByCurrency = new Map<string, number>();
+  for (const row of succeededRows) {
+    const currency = String(row._id ?? "").toLowerCase() || stripeCurrency;
+    paidByCurrency.set(
+      currency,
+      (paidByCurrency.get(currency) ?? 0) + row.total
+    );
+  }
+
+  const anomaly = anomalyRows[0];
+  if (anomaly && anomaly.count > 0) {
+    paidByCurrency.set(
+      stripeCurrency,
+      (paidByCurrency.get(stripeCurrency) ?? 0) +
+        toMinorUnits(anomaly.total, stripeCurrency)
+    );
+  }
+
+  const paidAmountByCurrency = [...paidByCurrency.entries()]
+    .map(([currency, minor]) => ({
+      currency,
+      amount: fromMinorUnits(minor, currency),
+    }))
+    .sort((a, b) => a.currency.localeCompare(b.currency));
+
+  // finalAmount carries no currency of its own; outstanding estimates are
+  // reported in the configured checkout currency (STRIPE_CURRENCY).
+  const unpaidTotal = unpaidAgg[0]?.total ?? 0;
+  const unpaidAmountByCurrency =
+    unpaidAgg[0] && unpaidAgg[0].count > 0
+      ? [{ currency: stripeCurrency, amount: unpaidTotal }]
+      : [];
+
+  const unpaidCount = completedBookings - paidBookings;
+  const totalPages = totalItems === 0 ? 0 : Math.ceil(totalItems / limit);
+
+  res.status(200).json({
+    success: true,
+    data: entries,
+    summary: {
+      totalCompletedBookings: completedBookings,
+      paidCount: paidBookings,
+      unpaidCount,
+      paidAmountByCurrency,
+      unpaidAmountByCurrency,
+    },
     pagination: {
       currentPage: page,
       limit,
