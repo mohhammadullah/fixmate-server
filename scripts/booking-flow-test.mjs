@@ -4,9 +4,11 @@
  * Verifies the booking lifecycle authorization boundaries end-to-end against
  * an isolated in-process app (via scripts/with-isolated-app.mjs) or the
  * BASE_URL server. Seeds one approved service and exercises customer create,
- * technician ownership, cross-user rejection, status transitions, and
- * cancellation ownership. Throwaway users, bookings and services are seeded
- * and removed on completion.
+ * technician ownership, cross-user rejection, status transitions,
+ * cancellation ownership, and cancelled-booking visibility (default
+ * exclusion from the customer/technician lists, explicit ?status=cancelled
+ * filtering, ownership isolation, and pagination totals). Throwaway users,
+ * bookings and services are seeded and removed on completion.
  *
  * Required env: MONGODB_URI, MONGODB_DB_NAME (from .env).
  * Optional env: BASE_URL, TEST_ORIGIN.
@@ -239,6 +241,90 @@ const main = async () => {
       method: "PATCH", headers: auth(custC.token), body: "{}",
     });
     check(ownerCancel.status === 200 && ownerCancel.body?.data?.status === "cancelled", `owner cancels own requested booking -> ${ownerCancel.status}`);
+
+    // --- Cancelled bookings visibility (default exclusion + explicit filter) ---
+    console.log("\n[cancelled visibility]");
+    const custDefault = await api("/api/bookings/my?limit=50", { headers: auth(custC.token) });
+    const custDefaultIds = (custDefault.body?.data ?? []).map((b) => b._id);
+    check(
+      custDefault.status === 200 && !custDefaultIds.includes(bookingId) && !custDefaultIds.includes(booking4Id),
+      "customer default list excludes cancelled bookings"
+    );
+    check(
+      custDefaultIds.includes(booking2Id) && custDefaultIds.includes(booking3Id),
+      "customer default list retains non-cancelled (rejected/completed) bookings"
+    );
+    const custCancelled = await api("/api/bookings/my?status=cancelled&limit=50", { headers: auth(custC.token) });
+    const custCancelIds = (custCancelled.body?.data ?? []).map((b) => b._id);
+    check(
+      custCancelled.status === 200 && custCancelIds.includes(bookingId) && custCancelIds.includes(booking4Id),
+      "customer ?status=cancelled returns only cancelled bookings"
+    );
+    check(
+      !custCancelIds.includes(booking2Id) && !custCancelIds.includes(booking3Id),
+      "customer cancelled filter excludes other statuses"
+    );
+    check(
+      custCancelled.body?.pagination?.totalItems === 2,
+      `customer cancelled filter totalItems reflects filter (got ${custCancelled.body?.pagination?.totalItems})`
+    );
+    const custRequested = await api("/api/bookings/my?status=requested&limit=50", { headers: auth(custC.token) });
+    check(
+      custRequested.status === 200 && (custRequested.body?.data ?? []).every((b) => b.status === "requested"),
+      "customer requested filter returns requested only"
+    );
+
+    const techDefault = await api("/api/bookings/technician?limit=50", { headers: auth(techA.token) });
+    const techDefaultIds = (techDefault.body?.data ?? []).map((b) => b._id);
+    check(
+      techDefault.status === 200 && !techDefaultIds.includes(bookingId) && !techDefaultIds.includes(booking4Id),
+      "technician default list excludes cancelled bookings"
+    );
+    check(
+      techDefaultIds.includes(booking2Id) && techDefaultIds.includes(booking3Id),
+      "technician default list retains non-cancelled bookings"
+    );
+    const techCancelled = await api("/api/bookings/technician?status=cancelled&limit=50", { headers: auth(techA.token) });
+    const techCancelIds = (techCancelled.body?.data ?? []).map((b) => b._id);
+    check(
+      techCancelled.status === 200 && techCancelIds.includes(bookingId) && techCancelIds.includes(booking4Id),
+      "technician ?status=cancelled returns only cancelled bookings"
+    );
+    check(
+      !techCancelIds.includes(booking3Id),
+      "technician cancelled filter excludes non-cancelled bookings"
+    );
+
+    // --- Cancelled bookings isolation (ownership boundaries hold) ---
+    console.log("\n[cancelled isolation]");
+    const custDCancelled = await api("/api/bookings/my?status=cancelled&limit=50", { headers: auth(custD.token) });
+    check(
+      custDCancelled.status === 200 && (custDCancelled.body?.data ?? []).length === 0,
+      "other customer cannot see custC's cancelled bookings"
+    );
+    const techBCancelled = await api("/api/bookings/technician?status=cancelled&limit=50", { headers: auth(techB.token) });
+    check(
+      techBCancelled.status === 200 && (techBCancelled.body?.data ?? []).length === 0,
+      "other technician cannot see techA's cancelled bookings"
+    );
+
+    // --- Cancelled filter pagination totals ---
+    console.log("\n[cancelled pagination]");
+    const page1 = await api("/api/bookings/my?status=cancelled&page=1&limit=1", { headers: auth(custC.token) });
+    check(
+      page1.status === 200 && page1.body?.pagination?.totalItems === 2 && page1.body?.pagination?.totalPages === 2 && page1.body?.pagination?.hasNextPage === true && page1.body?.pagination?.hasPrevPage === false,
+      `cancelled page 1: totals reflect filter (totalItems=${page1.body?.pagination?.totalItems}, totalPages=${page1.body?.pagination?.totalPages})`
+    );
+    const page2 = await api("/api/bookings/my?status=cancelled&page=2&limit=1", { headers: auth(custC.token) });
+    check(
+      page2.status === 200 && page2.body?.pagination?.hasNextPage === false && page2.body?.pagination?.hasPrevPage === true,
+      "cancelled page 2: no next page, has prev page"
+    );
+    const pageTech = await api("/api/bookings/technician?status=cancelled&page=1&limit=1", { headers: auth(techA.token) });
+    check(
+      pageTech.status === 200 && pageTech.body?.pagination?.totalItems === 2,
+      `technician cancelled filter totalItems reflects filter (got ${pageTech.body?.pagination?.totalItems})`
+    );
   } finally {
     await cleanup();
     console.log("\ncleanup: seeded users/bookings/service removed");

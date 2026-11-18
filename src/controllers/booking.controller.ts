@@ -336,6 +336,10 @@ export const listTechnicianBookings = async (
 
   if (status) {
     filter.status = status;
+  } else {
+    // Cancelled bookings are permanently retained but excluded from the
+    // default list; pass ?status=cancelled to see only cancelled records.
+    filter.status = { $ne: "cancelled" };
   }
 
   // MongoDB errors propagate to Express 5, which forwards them to the
@@ -635,6 +639,10 @@ export const listMyBookings = async (
 
   if (status) {
     filter.status = status;
+  } else {
+    // Cancelled bookings are permanently retained but excluded from the
+    // default list; pass ?status=cancelled to see only cancelled records.
+    filter.status = { $ne: "cancelled" };
   }
 
   // MongoDB errors propagate to Express 5, which forwards them to the

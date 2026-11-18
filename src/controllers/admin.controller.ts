@@ -760,8 +760,10 @@ export const listAllBookings = async (
   const limit = parsed.data.limit ?? 12;
   const pattern = adminSearchFilter(parsed.data.search);
 
-  const filter = {
-    ...(status ? { status } : {}),
+  const filter: Filter<Booking> = {
+    // Cancelled bookings are permanently retained but excluded from the
+    // default list; pass ?status=cancelled to see only cancelled records.
+    ...(status ? { status } : { status: { $ne: "cancelled" } }),
     ...(paymentStatus ? { paymentStatus } : {}),
     ...(pattern
       ? {

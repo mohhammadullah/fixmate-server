@@ -292,13 +292,33 @@ const main = async () => {
 
     // --- All bookings ---
     console.log("\n[all bookings]");
-    const bookingsRes = await api("/api/admin/bookings?page=1&limit=2", { headers: auth(admin.token) });
-    check(bookingsRes.status === 200 && bookingsRes.body?.data?.length === 2, `bookings list -> ${bookingsRes.status}, 2 items`);
-    check(bookingsRes.body?.pagination?.hasNextPage === true, "bookings hasNextPage true");
+    const seededSearch = `search=${encodeURIComponent("Seeded Admin Test Repair")}`;
+    const bookingsRes = await api(`/api/admin/bookings?${seededSearch}&page=1&limit=2`, { headers: auth(admin.token) });
+    check(bookingsRes.status === 200 && bookingsRes.body?.data?.length === 2, `bookings list -> ${bookingsRes.status}, 2 items (seeded requested + in-progress)`);
+    check(bookingsRes.body?.pagination?.hasNextPage === false, "bookings hasNextPage false (only 2 seeded bookings match the default list)");
     const oneBooking = bookingsRes.body?.data?.[0] ?? {};
     check(typeof oneBooking.id === "string" && typeof oneBooking.serviceTitle === "string", "safe booking fields present");
     const leakedBooking = ["customerId", "technicianId", "serviceId", "_id"].filter((k) => k in oneBooking);
     check(leakedBooking.length === 0, `booking DTO excludes internal ids (found: ${leakedBooking.join(", ") || "none"})`);
+    const defaultIds = (bookingsRes.body?.data ?? []).map((b) => b.id);
+    check(
+      !defaultIds.includes(bookingIds[2].toHexString()),
+      "default all-bookings list excludes the seeded cancelled booking"
+    );
+    const cancelledRes = await api(`/api/admin/bookings?${seededSearch}&status=cancelled&limit=50`, { headers: auth(admin.token) });
+    check(
+      cancelledRes.status === 200 && cancelledRes.body?.data?.length === 1 && cancelledRes.body?.data?.[0]?.status === "cancelled" && cancelledRes.body?.data?.[0]?.id === bookingIds[2].toHexString(),
+      "admin ?status=cancelled returns only the seeded cancelled booking (read-only access to all cancelled bookings)"
+    );
+    check(
+      cancelledRes.body?.pagination?.totalItems === 1,
+      `admin cancelled filter totalItems reflects filter (got ${cancelledRes.body?.pagination?.totalItems})`
+    );
+    const mixedRes = await api(`/api/admin/bookings?${seededSearch}&limit=50`, { headers: auth(admin.token) });
+    check(
+      mixedRes.status === 200 && (mixedRes.body?.data ?? []).every((b) => b.status !== "cancelled"),
+      "default all-bookings list returns no cancelled bookings under search scope"
+    );
     const statusFilter = await api("/api/admin/bookings?status=in-progress&limit=50", { headers: auth(admin.token) });
     check(statusFilter.status === 200 && statusFilter.body?.data?.some((b) => b.status === "in-progress"), "status filter works");
     const paymentFilter = await api("/api/admin/bookings?paymentStatus=paid&limit=50", { headers: auth(admin.token) });
