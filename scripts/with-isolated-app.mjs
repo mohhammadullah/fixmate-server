@@ -1,13 +1,13 @@
 /**
  * FixMate isolated-app test runner (development only).
  *
- * The :5000 development server shares one 100-request/15-minute auth rate
- * limit per client; running the whole integration chain against it can
- * exhaust the budget and fail suites with HTTP 429 — not a defect, just a
- * shared window. This runner sidesteps it by booting its OWN copy of the API
- * on an ephemeral port with a fresh auth-limit window, backed by the same
- * real development MongoDB database. Each run executes exactly one ordinary
- * BASE_URL-pointed suite — the suite itself needs no changes.
+ * The :5000 development server shares one client-IP budget for API rate
+ * limits; running the whole integration chain against it can exhaust the
+ * budget and fail suites with HTTP 429 — not a defect, just a shared
+ * window. This runner sidesteps it by booting its OWN copy of the API
+ * on an ephemeral port with fresh rate-limit windows, backed by the
+ * same real development MongoDB database. Each run executes exactly one
+ * ordinary BASE_URL-pointed suite — the suite itself needs no changes.
  *
  * Usage: node scripts/with-isolated-app.mjs <suite.mjs> [--prod]
  *   e.g. node scripts/with-isolated-app.mjs scripts/booking-details-test.mjs

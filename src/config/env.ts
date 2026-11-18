@@ -17,6 +17,30 @@ const envSchema = z.object({
       "MONGODB_URI must start with mongodb:// or mongodb+srv://"
     ),
   MONGODB_DB_NAME: z.string().min(1, "MONGODB_DB_NAME is required"),
+  // Comma-separated reverse-proxy IPs or CIDR ranges (e.g.
+  // "10.0.0.0/8,192.168.1.10"). Passed to Better Auth so it can resolve the
+  // real client IP from X-Forwarded-For and key rate limits per client
+  // instead of falling back to one shared bucket. Leave unset only when
+  // clients connect directly. Never set this to a range you do not control.
+  TRUSTED_PROXIES: z
+    .string()
+    .optional()
+    .transform((value) =>
+      (value ?? "")
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter(Boolean)
+    )
+    .pipe(
+      z.array(
+        z
+          .string()
+          .regex(
+            /^[0-9a-fA-F.:]+(\/\d{1,3})?$/,
+            "TRUSTED_PROXIES entries must be IPs or CIDR ranges"
+          )
+      )
+    ),
   BETTER_AUTH_SECRET: z
     .string()
     .min(32, "BETTER_AUTH_SECRET must be at least 32 characters long"),
@@ -67,6 +91,7 @@ export const env = {
   ...parsed.data,
   CLIENT_URL: clientUrl,
   BETTER_AUTH_URL: betterAuthUrl,
+  TRUSTED_PROXIES: parsed.data.TRUSTED_PROXIES ?? [],
   isProduction: parsed.data.NODE_ENV === "production",
   isDevelopment: parsed.data.NODE_ENV === "development",
 } as const;

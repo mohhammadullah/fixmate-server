@@ -32,24 +32,18 @@ export const createApp = (auth: Auth) => {
     })
   );
 
-  // Throttle authentication endpoints against brute-force/credential
-  // stuffing. Generous enough for normal development and test usage.
-  const authLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    limit: 100,
-    standardHeaders: "draft-8",
-    legacyHeaders: false,
-    message: {
-      success: false,
-      message: "Too many requests, please try again later.",
-    },
-  });
+  // NOTE: Better Auth owns rate limiting for /api/auth (see
+  // src/config/auth.ts): explicit, path-aware rules with environment-aware
+  // budgets. A second Express limiter here would double-count every auth
+  // request — Better Auth runs its check in the request phase before this
+  // middleware would ever see the response.
 
-  // Broad ceiling for the rest of the API: normal browser usage never
-  // approaches it, abuse does. The auth bucket above stays tighter.
+  // Broad ceiling for non-auth API traffic: normal browser usage never
+  // approaches it, abuse does. Development/test gets a generous budget
+  // because all local traffic shares 127.0.0.1; production stays tight.
   const apiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    limit: 600,
+    limit: env.isProduction ? 600 : 6000,
     standardHeaders: "draft-8",
     legacyHeaders: false,
     message: {
@@ -62,7 +56,8 @@ export const createApp = (auth: Auth) => {
   // Better Auth handler MUST be mounted before express.json() so it can
   // read the raw request body itself. Express 5 requires a named wildcard
   // ({*any}) — a bare "*" is no longer valid path-to-regexp syntax.
-  app.use("/api/auth", authLimiter);
+  // Rate limiting happens inside Better Auth, so /api/auth never reaches
+  // the general apiLimiter below.
   app.all("/api/auth/{*any}", toNodeHandler(auth));
 
   // The Stripe webhook must see the raw request body for signature

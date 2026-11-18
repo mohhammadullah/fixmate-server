@@ -100,6 +100,20 @@ The pattern is always **server-only** — no secret is ever exposed through
   assumed. If you deploy behind a different number of hops (e.g.
   Cloudflare + nginx), raise the hop count accordingly so
   `express-rate-limit` can key on the true client IP.
+- Better Auth runs its own, path-aware rate limiting on `/api/auth`
+  (explicit configuration in `src/config/auth.ts`): 10 sign-in/sign-up
+  attempts per minute per client IP in production, 5 per 5 minutes for
+  email-recovery endpoints, and a generous 100/minute general budget.
+  Express does **not** add a second limiter on those paths.
+- Better Auth reads `X-Forwarded-For` itself (Express's `trust proxy` does
+  not apply to it). Set `TRUSTED_PROXIES=<proxy IPs/CIDRs>` in production
+  so it can resolve the real client IP from a multi-hop proxy chain.
+  Without it (or without `X-Forwarded-For` at all), Better Auth falls back
+  to a **single shared bucket** for all users and sign-in will start
+  returning 429 for everyone after the budget is spent.
+- Rate-limit counters are stored in per-process memory. With more than one
+  replica, raise `rateLimit.storage` in `src/config/auth.ts` to `database`
+  (or a shared secondary storage) so the budget is shared across replicas.
 - `helmet` sets sensible defaults (CSP, `X-Frame-Options: SAMEORIGIN`, …).
 - `x-powered-by` is disabled.
 - The server is compatible with HTTP/1.1 and HTTP/2 fronting; termination is

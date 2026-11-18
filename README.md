@@ -407,7 +407,8 @@ npm run build     # tsc — required before isolated tests (they import ../dist)
 Validation order: `npm run type-check && npm run build && npm test`.
 
 Suites cover: auth hardening (prod test-route 404, fresh DB role lookup,
-stale-JWT rejection), payments (Stripe mocked; full checkout + webhook
+stale-JWT rejection), auth rate limiting (dev budget not prematurely hit;
+prod throttles credential paths per client IP after 10 attempts/minute), payments (Stripe mocked; full checkout + webhook
 reconciliation), bookings (ownership, state machine, cancellation), services
 (mine/theirs, image upload, listing), admin dashboard, admin payments,
 admin services, technician applications, profile and Main Admin transfer /
