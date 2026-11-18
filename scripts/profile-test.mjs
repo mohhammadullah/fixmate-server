@@ -161,13 +161,13 @@ const main = async () => {
     const bProfile = await api("/api/users/me", { headers: auth(b.token) });
     check(bProfile.body?.data?.area === "North District", "B sees their own update");
 
-    // --- Missing account ---
+    // --- Missing account (JWT outlives the user doc) -> fail closed 401 ---
     console.log("\n[missing account]");
     await users.deleteOne({ _id: b.userId });
     const deletedGet = await api("/api/users/me", { headers: auth(b.token) });
-    check(deletedGet.status === 404, `GET /me after account deletion -> ${deletedGet.status} (expected 404)`);
+    check(deletedGet.status === 401, `GET /me after account deletion -> ${deletedGet.status} (expected 401)`);
     const deletedPatch = await api("/api/users/me", { method: "PATCH", headers: auth(b.token), body: JSON.stringify({ name: "Ghost" }) });
-    check(deletedPatch.status === 404, `PATCH /me after account deletion -> ${deletedPatch.status} (expected 404)`);
+    check(deletedPatch.status === 401, `PATCH /me after account deletion -> ${deletedPatch.status} (expected 401)`);
   } finally {
     const ids = [a.userId, technician.userId, admin.userId];
     await users.deleteMany({ _id: { $in: ids } });

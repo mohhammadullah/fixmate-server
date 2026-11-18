@@ -94,7 +94,11 @@ export const createApp = (auth: Auth) => {
     });
   });
 
-  app.use("/api/test", testRoutes);
+  // Demo/test endpoints are development-only. In production they are never
+  // mounted, so requests hit the standard 404 handler before anything runs.
+  if (!env.isProduction) {
+    app.use("/api/test", testRoutes);
+  }
   app.use("/api/services", serviceRoutes);
   app.use("/api/bookings", bookingRoutes);
   app.use("/api/technician-applications", technicianApplicationRoutes);

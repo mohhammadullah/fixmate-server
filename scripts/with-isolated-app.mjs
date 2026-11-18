@@ -9,8 +9,14 @@
  * real development MongoDB database. Each run executes exactly one ordinary
  * BASE_URL-pointed suite — the suite itself needs no changes.
  *
- * Usage: node scripts/with-isolated-app.mjs <suite.mjs>
+ * Usage: node scripts/with-isolated-app.mjs <suite.mjs> [--prod]
  *   e.g. node scripts/with-isolated-app.mjs scripts/booking-details-test.mjs
+ *        node scripts/with-isolated-app.mjs scripts/auth-hardening-test.mjs --prod
+ *
+ * --prod boots the API with NODE_ENV=production so production-only behavior
+ * (e.g. /api/test/* returning 404) can be verified. Development tests omit it.
+ *
+ * Requires `npm run build` first (the runner imports ../dist).
  *
  * Nothing here touches the running development server or .env.
  */
@@ -36,10 +42,12 @@ const getFreePort = () =>
   });
 
 const main = async () => {
-  const [suite] = process.argv.slice(2);
+  const argv = process.argv.slice(2);
+  const prod = argv.includes("--prod");
+  const suite = argv.find((arg) => arg !== "--prod");
 
-  if (!suite || process.argv.slice(2).length !== 1) {
-    console.error("usage: node scripts/with-isolated-app.mjs <suite.mjs>");
+  if (!suite || argv.filter((arg) => arg !== "--prod").length !== 1) {
+    console.error("usage: node scripts/with-isolated-app.mjs <suite.mjs> [--prod]");
     process.exit(1);
   }
 
@@ -48,6 +56,9 @@ const main = async () => {
   // Pre-set test-only env BEFORE any dist import. dotenv does not override
   // variables that are already set.
   process.env.BETTER_AUTH_URL = `http://127.0.0.1:${port}`;
+  if (prod) {
+    process.env.NODE_ENV = "production";
+  }
   process.env.STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY ?? "sk_test_mock_placeholder";
   process.env.STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET ?? "whsec_mock_test_secret_0123456789";
   process.env.STRIPE_CURRENCY = process.env.STRIPE_CURRENCY ?? "usd";
