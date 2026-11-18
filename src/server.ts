@@ -1,10 +1,11 @@
 
-import type { Server } from "node:http";
+import { createServer, type Server } from "node:http";
 import { connectDB, closeDB } from "./config/db.js";
 import { ensureIndexes } from "./config/indexes.js";
 import { createAuth } from "./config/auth.js";
 import { createApp } from "./app.js";
 import { env } from "./config/env.js";
+import { initSocketServer, closeSocketServer } from "./socket.js";
 
 const startServer = async (): Promise<void> => {
   // Connect to MongoDB BEFORE creating Better Auth so the adapter
@@ -27,7 +28,12 @@ const startServer = async (): Promise<void> => {
   const auth = createAuth();
   const app = createApp(auth);
 
-  const server: Server = app.listen(env.PORT, () => {
+  const server: Server = createServer(app);
+  // Attach the Socket.IO layer (authenticated via Better Auth JWTs).
+  initSocketServer(server);
+  console.log("Socket.IO attached at /socket.io");
+
+  server.listen(env.PORT, () => {
     console.log(`FixMate server running on port ${env.PORT}`);
     console.log(`Local URL: http://localhost:${env.PORT}`);
   });
@@ -37,11 +43,12 @@ const startServer = async (): Promise<void> => {
 
     server.close(async () => {
       try {
+        await closeSocketServer();
         await closeDB();
         console.log("MongoDB connection closed.");
         process.exit(0);
       } catch (error) {
-        console.error("Error while closing MongoDB connection:", error);
+        console.error("Error while shutting down:", error);
         process.exit(1);
       }
     });

@@ -1,6 +1,10 @@
 
 import { z } from "zod";
-import { SERVICE_CATEGORIES, SERVICE_APPROVAL_STATUSES } from "../models/service.model.js";
+import {
+  ALL_SERVICE_CATEGORIES,
+  SERVICE_CATEGORIES,
+  SERVICE_APPROVAL_STATUSES,
+} from "../models/service.model.js";
 
 const QUERY_STRING_MAX = 200;
 
@@ -8,16 +12,66 @@ const QUERY_STRING_MAX = 200;
 // literally. Used for both the `search` term and the `location` filter.
 export const escapeRegExp = (value: string): string =>
   value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// Nearby services query: matches approved+available services against an area
+// label or the caller's (consented, approximate) coordinates. At least one
+// of `area` or `lat`+`lng` is required.
+export const nearbyServicesQuerySchema = z.object({
+  area: z
+    .string({ error: "area must be a string" })
+    .trim()
+    .max(120, "area must be at most 120 characters")
+    .optional(),
+  lat: z
+    .string({ error: "lat must be a string" })
+    .trim()
+    .regex(/^-?\d+(\.\d+)?$/, "lat must be a decimal number")
+    .transform(Number)
+    .pipe(
+      z
+        .number({ error: "lat must be a number" })
+        .min(-90, "lat must be between -90 and 90")
+        .max(90, "lat must be between -90 and 90")
+    )
+    .optional(),
+  lng: z
+    .string({ error: "lng must be a string" })
+    .trim()
+    .regex(/^-?\d+(\.\d+)?$/, "lng must be a decimal number")
+    .transform(Number)
+    .pipe(
+      z
+        .number({ error: "lng must be a number" })
+        .min(-180, "lng must be between -180 and 180")
+        .max(180, "lng must be between -180 and 180")
+    )
+    .optional(),
+  limit: z
+    .string({ error: "limit must be a string" })
+    .trim()
+    .refine((v) => /^[1-9]\d*$/.test(v), "limit must be a positive integer")
+    .transform(Number)
+    .pipe(z.number().int().min(1).max(24, "limit must be at most 24"))
+    .optional(),
+}).refine(
+  (value) => value.area !== undefined || (value.lat !== undefined && value.lng !== undefined),
+  { message: "Provide at least an area or coordinates" }
+);
+
+export type NearbyServicesQueryData = z.infer<typeof nearbyServicesQuerySchema>;
 const titleSchema = z
   .string({ error: "Title is required and must be a string" })
   .trim()
   .min(3, "Title must be at least 3 characters long")
   .max(120, "Title must be at most 120 characters long");
 
-const categorySchema = z.enum(SERVICE_CATEGORIES, {
+// Canonical Assignment 9 categories are the primary values. Legacy values
+// remain accepted so technicians can still edit older services and existing
+// records stay valid — no destructive data migration.
+const categorySchema = z.enum(ALL_SERVICE_CATEGORIES, {
   error: `Category must be one of the supported categories: ${SERVICE_CATEGORIES.join(
     ", "
-  )}`,
+  )} (legacy values are still accepted)`,
 });
 
 const descriptionSchema = z
@@ -150,7 +204,7 @@ export const listServicesQuerySchema = z
       .string({ error: "Category must be a string" })
       .trim()
       .pipe(
-        z.enum(SERVICE_CATEGORIES, {
+        z.enum(ALL_SERVICE_CATEGORIES, {
           error: `Category must be one of the supported categories: ${SERVICE_CATEGORIES.join(", ")}`,
         })
       )

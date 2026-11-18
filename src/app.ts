@@ -13,6 +13,11 @@ import adminRoutes from "./routes/admin.routes.js";
 import userRoutes from "./routes/user.routes.js";
 import uploadRoutes from "./routes/upload.routes.js";
 import paymentRoutes from "./routes/payment.routes.js";
+import reviewRoutes from "./routes/review.routes.js";
+import homeRoutes from "./routes/home.routes.js";
+import notificationRoutes from "./routes/notification.routes.js";
+import availabilityRoutes from "./routes/availability.routes.js";
+import couponRoutes from "./routes/coupon.routes.js";
 import { errorHandler, notFoundHandler } from "./middleware/errorHandler.js";
 import { env } from "./config/env.js";
 import type { Auth } from "./config/auth.js";
@@ -96,6 +101,11 @@ export const createApp = (auth: Auth) => {
   }
   app.use("/api/services", serviceRoutes);
   app.use("/api/bookings", bookingRoutes);
+  app.use("/api/reviews", reviewRoutes);
+  app.use("/api/home", homeRoutes);
+  app.use("/api/notifications", notificationRoutes);
+  app.use("/api", availabilityRoutes);
+  app.use("/api/coupons", couponRoutes);
   app.use("/api/technician-applications", technicianApplicationRoutes);
   app.use("/api/admin", adminRoutes);
   app.use("/api/users", userRoutes);

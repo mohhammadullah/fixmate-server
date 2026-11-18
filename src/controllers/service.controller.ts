@@ -3,12 +3,19 @@ import type { Request, Response } from "express";
 import { ObjectId, type Filter, type Sort } from "mongodb";
 import { getDB } from "../config/db.js";
 import type { AuthenticatedRequest } from "../middleware/verifyToken.js";
-import { createServiceSchema, updateServiceSchema, rejectServiceSchema, listServicesQuerySchema, listMyServicesQuerySchema, escapeRegExp, type ListServicesSort } from "../validators/service.validator.js";
+import { createServiceSchema, updateServiceSchema, rejectServiceSchema, listServicesQuerySchema, listMyServicesQuerySchema, escapeRegExp, nearbyServicesQuerySchema, type ListServicesSort } from "../validators/service.validator.js";
 import {
   getServicesCollection,
+  categoryFilterValues,
   type Service,
   type ServiceApprovalStatus,
 } from "../models/service.model.js";
+import {
+  fetchServiceRatings,
+  fetchServiceRating,
+  UNRATED_RATING,
+} from "../utils/ratings.js";
+import { haversineKm, isValidLatLng, roundDistanceKm } from "../utils/geo.js";
 
 // Better Auth's MongoDB adapter stores users in the singular `user`
 // collection with `_id` as an ObjectId; the JWT's `id` claim is the
@@ -22,7 +29,7 @@ interface AuthUserDocument {
   role?: unknown;
 }
 
-// POST /api/services — technician only (verifyToken -> verifyTechnician).
+// POST /api/services â€” technician only (verifyToken -> verifyTechnician).
 // Technician identity/role are taken exclusively from the verified JWT and
 // the server-side user document; client-supplied identity/status fields
 // are rejected by the strict validator.
@@ -178,7 +185,7 @@ const parseAdminServiceId = (raw: unknown): ObjectId | null => {
   return new ObjectId(id);
 };
 
-// PATCH /api/services/:id — technician only (verifyToken -> verifyTechnician).
+// PATCH /api/services/:id â€” technician only (verifyToken -> verifyTechnician).
 // Ownership is enforced by the {_id, technicianId} filter, so one technician
 // can never edit another's service (404 either way, indistinguishable).
 export const updateService = async (
@@ -259,7 +266,7 @@ export const updateService = async (
   });
 };
 
-// DELETE /api/services/:id — technician only (verifyToken -> verifyTechnician).
+// DELETE /api/services/:id â€” technician only (verifyToken -> verifyTechnician).
 export const deleteService = async (
   req: AuthenticatedRequest,
   res: Response
@@ -313,7 +320,7 @@ export const deleteService = async (
   });
 };
 
-// GET /api/services/:id — public service details.
+// GET /api/services/:id â€” public service details.
 //
 // Strict 24-char hex ObjectId validation (ObjectId.isValid also accepts
 // 12-byte strings). Only approved + available services are visible, using
@@ -351,9 +358,11 @@ export const getServiceDetails = async (
     return;
   }
 
+  const rating = await fetchServiceRating(service._id);
+
   res.status(200).json({
     success: true,
-    data: service,
+    data: { ...service, rating },
   });
 };
 
@@ -362,7 +371,7 @@ export const getServiceDetails = async (
 // Race-condition safety: the pending-only transition is enforced by the
 // atomic {_id, approvalStatus: "pending"} filter passed to findOneAndUpdate,
 // never by a prior read. Two concurrent admin decisions therefore cannot
-// both win — the loser matches nothing and is reported as 409 (or 404 if
+// both win â€” the loser matches nothing and is reported as 409 (or 404 if
 // the document vanished in between). The second lookup below runs only
 // after a failed atomic update and exists purely to distinguish those two
 // cases; it never authorizes a write.
@@ -390,13 +399,13 @@ const respondAfterFailedTransition = async (
   });
 };
 
-// GET /api/services — public, no authentication.
+// GET /api/services â€” public, no authentication.
 //
 // Only approved + available services are returned. Internal-only fields
 // (rejectionReason, technicianEmail, technicianId) are stripped by the
 // projection; everything else is a public service field. All query input is
 // validated by listServicesQuerySchema, regex input is escaped, and the
-// filter is a typed MongoDB Filter built exclusively from validated values —
+// filter is a typed MongoDB Filter built exclusively from validated values â€”
 // raw query parameters can never reach the query engine.
 
 // Documents returned by the public listing: everything on Service except the
@@ -503,7 +512,13 @@ export const listServices = async (
   }
 
   if (category) {
-    filter.category = category;
+    // A canonical category also matches its unambiguous legacy aliases, so
+    // older services remain discoverable without rewriting their documents.
+    const values = categoryFilterValues(category);
+    filter.category =
+      values.length === 1
+        ? (values[0] as Service["category"])
+        : ({ $in: values } as unknown as Service["category"]);
   }
 
   if (location) {
@@ -531,9 +546,17 @@ export const listServices = async (
 
   const totalPages = totalItems === 0 ? 0 : Math.ceil(totalItems / limit);
 
+  // One aggregation for the whole page of services â€” never one query per
+  // service. Ratings come from the review subdocuments stored on bookings.
+  const ratings = await fetchServiceRatings(items.map((item) => item._id));
+  const data = items.map((item) => ({
+    ...item,
+    rating: ratings.get(item._id.toHexString()) ?? UNRATED_RATING,
+  }));
+
   res.status(200).json({
     success: true,
-    data: items,
+    data,
     pagination: {
       currentPage: page,
       limit,
@@ -545,9 +568,134 @@ export const listServices = async (
   });
 };
 
-// PATCH /api/services/:id/approve — admin only (verifyToken -> verifyAdmin).
+// PATCH /api/services/:id/approve â€” admin only (verifyToken -> verifyAdmin).
 // Approval identity is never taken from the request; the token only
 // authorizes the caller. All other document fields are preserved.
+export const listNearbyServices = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  const parsed = nearbyServicesQuerySchema.safeParse(req.query);
+
+  if (!parsed.success) {
+    res.status(400).json({
+      success: false,
+      message: "Validation failed.",
+      errors: parsed.error.issues.map((issue) => ({
+        field: issue.path.join("."),
+        message: issue.message,
+      })),
+    });
+    return;
+  }
+
+  const { area, lat, lng } = parsed.data;
+  const limit = parsed.data.limit ?? 12;
+  const areaRegex = area ? new RegExp(escapeRegExp(area), "i") : undefined;
+
+  // Candidate pool: the newest approved+available services, bounded low to
+  // keep the in-memory ranking cheap. Full documents are fetched only to
+  // compute distance; the response DTO strips internal fields below.
+  const candidates = await getServicesCollection()
+    .find({ approvalStatus: "approved", availabilityStatus: "available" })
+    .sort({ createdAt: -1, _id: -1 })
+    .limit(60)
+    .toArray();
+
+  if (candidates.length === 0) {
+    res.status(200).json({ success: true, data: [], meta: { sort: "none", area: area ?? null } });
+    return;
+  }
+
+  // Batch-load technician location signals for the candidate pool (areas +
+  // consented coordinates) — one query, never per-service N+1.
+  const technicianIds = [...new Map(candidates.map((s) => [s.technicianId.toHexString(), s.technicianId])).values()];
+  const technicians = await getDB()
+    .collection(USERS_COLLECTION)
+    .find(
+      { _id: { $in: technicianIds } },
+      { projection: { availability: 1, location: 1 } }
+    )
+    .toArray();
+
+  const techInfo = new Map<string, { areas: string[]; coords?: { lat: number; lng: number } }>();
+  for (const tech of technicians) {
+    const availability = (tech as { availability?: { serviceAreas?: unknown; timezone?: unknown } }).availability;
+    const areas = Array.isArray(availability?.serviceAreas)
+      ? availability.serviceAreas.filter((a): a is string => typeof a === "string")
+      : [];
+    const loc = (tech as { location?: { coordinates?: { lat?: unknown; lng?: unknown } } }).location;
+    const rawCoords = loc?.coordinates;
+    const coords =
+      rawCoords && typeof rawCoords.lat === "number" && typeof rawCoords.lng === "number"
+        ? { lat: rawCoords.lat, lng: rawCoords.lng }
+        : undefined;
+    techInfo.set(tech._id.toHexString(), { areas, coords });
+  }
+
+  const wantsCoords = lat !== undefined && lng !== undefined;
+  const searchCoords = wantsCoords ? { lat: lat as number, lng: lng as number } : undefined;
+
+  let scored = candidates.map((service) => {
+    const tech = techInfo.get(service.technicianId.toHexString());
+    const locationText = `${service.location} ${(tech?.areas ?? []).join(" ")}`;
+    const areaMatch = areaRegex ? areaRegex.test(locationText.toLowerCase()) : undefined;
+    const distanceKm = searchCoords && tech?.coords && isValidLatLng(tech.coords.lat, tech.coords.lng)
+      ? roundDistanceKm(haversineKm(searchCoords, tech.coords))
+      : undefined;
+    return { service, areaMatch, distanceKm };
+  });
+
+  // Area filter (when given): services whose location or the technician's
+  // service areas match.
+  if (areaRegex) {
+    scored = scored.filter((entry) => entry.areaMatch);
+  }
+
+  // Rank: by distance when both sides have coordinates, otherwise newest.
+  scored.sort((a, b) => {
+    const aHas = a.distanceKm !== undefined;
+    const bHas = b.distanceKm !== undefined;
+    if (aHas && bHas) return (a.distanceKm as number) - (b.distanceKm as number);
+    if (aHas !== bHas) return aHas ? -1 : 1;
+    return 0; // preserve newest-first order
+  });
+
+  const selected = scored.slice(0, limit).map(({ service, distanceKm }) => ({
+    _id: service._id,
+    title: service.title,
+    category: service.category,
+    location: service.location,
+    image: service.image,
+    hourlyRate: service.hourlyRate,
+    securityDeposit: service.securityDeposit,
+    maxCapacity: service.maxCapacity,
+    amenities: service.amenities,
+    overview: service.overview,
+    description: service.description,
+    technicianName: service.technicianName,
+    createdAt: service.createdAt,
+    ...(distanceKm !== undefined ? { distanceKm } : {}),
+  }));
+
+  // Ratings in one aggregation for the selected set.
+  const ratings = await fetchServiceRatings(selected.map((item) => item._id));
+  const data = selected.map((item) => ({
+    ...item,
+    rating: ratings.get(item._id.toHexString()) ?? UNRATED_RATING,
+  }));
+
+  res.status(200).json({
+    success: true,
+    data,
+    meta: {
+      sort: wantsCoords ? "distance" : areaRegex ? "area" : "newest",
+      area: area ?? null,
+      limit,
+    },
+  });
+};
+
 export const approveService = async (
   req: AuthenticatedRequest,
   res: Response
@@ -596,7 +744,7 @@ export const approveService = async (
   });
 };
 
-// PATCH /api/services/:id/reject — admin only (verifyToken -> verifyAdmin).
+// PATCH /api/services/:id/reject â€” admin only (verifyToken -> verifyAdmin).
 // The only client-supplied value is rejectionReason, validated and trimmed
 // by rejectServiceSchema; everything server-controlled is rejected by the
 // strict object shape. All other document fields are preserved.
@@ -665,7 +813,7 @@ export const rejectService = async (
 
 const MY_SERVICES_SORT: Sort = { createdAt: -1, _id: -1 };
 
-// GET /api/services/my — technician only (verifyToken -> verifyTechnician).
+// GET /api/services/my â€” technician only (verifyToken -> verifyTechnician).
 // Returns only services whose technicianId matches the verified JWT; any
 // technicianId in the query string is stripped by the schema and ignored.
 // Sorted newest first; pagination metadata matches the booking list
@@ -751,4 +899,6 @@ export const listMyServices = async (
     },
   });
 };
+
+
 

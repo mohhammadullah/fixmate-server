@@ -48,6 +48,7 @@ Optional configuration:
 | `STRIPE_CURRENCY`       | `usd`                    | lowercase ISO 4217; `bdt` only if your Stripe account supports charging in BDT |
 | `STRIPE_API_BASE`       | (unset)                  | **test-only** host override; never set in production |
 | `IMGBB_UPLOAD_URL`      | `https://api.imgbb.com/1/upload` | override for testing with a mocked ImgBB server |
+| `INVOICE_TAX_RATE`      | (unset)                  | optional platform tax rate (e.g. `0.05`), applied **inclusive** to invoices |
 
 The pattern is always **server-only** — no secret is ever exposed through
 `NEXT_PUBLIC_*` (client), inlined in a client bundle, or logged.
@@ -66,14 +67,20 @@ The pattern is always **server-only** — no secret is ever exposed through
   nothing manual is required. The `bookings`
   `bookings_active_customer_service_unique` partial index is the reason the
   constraint on duplicate active bookings cannot be bypassed by
-  application-level races.
+  application-level races. The schedule partial unique index
+  (`bookings_technician_schedule_active_unique`) prevents double-booking the
+  same technician slot. The coupon partial index
+  (`bookings_customerId_1_couponCode_1`) supports per-customer coupon-limit
+  checks. The `review.createdAt` partial index supports the latest-reviews feed.
 
 ## Stripe webhook
 
 - Create a Dashboard → Developers → Webhooks endpoint at
   `https://<YOUR_DOMAIN>/api/payments/webhook`.
-- Subscribe to: `checkout.session.completed`, `checkout.session.expired`,
-  `checkout.session.async_payment_failed`.
+- Subscribe to: `checkout.session.completed`,
+  `checkout.session.async_payment_succeeded`,
+  `checkout.session.async_payment_failed`, `checkout.session.expired`,
+  **`charge.refunded`** (required for refund reconciliation).
 - Copy the signing secret (`whsec_…`) into `STRIPE_WEBHOOK_SECRET`.
 - The endpoint **verifies the signature** with the raw request body before
   calling any business logic. A wrong, missing or expired signature returns
@@ -119,6 +126,20 @@ The pattern is always **server-only** — no secret is ever exposed through
 - The server is compatible with HTTP/1.1 and HTTP/2 fronting; termination is
   expected at the reverse proxy or platform (Fly.io/Render already handle
   this).
+
+## Socket.IO
+
+- The server attaches Socket.IO at `/socket.io` (HTTP `GET` returns the
+  handshake; transports `polling` + `websocket`).
+- Clients must connect with the Better Auth JWT in the handshake
+  (`auth.token`). The token is verified against the JWKS (`BETTER_AUTH_URL`)
+  and the role is re-read from the database on every connection.
+- Reverse proxies must forward `Upgrade` / `Connection` headers for the
+  websocket path (usually already enabled for `/socket.io`), or clients
+  fall back to long-polling automatically.
+- In-memory rooms (`user:<hex>`, `booking:<hex>`) are per server process;
+  multi-instance deployments would need a shared adapter (e.g. Redis) for
+  cross-instance delivery. Single-instance deployments need nothing.
 
 ## Health check
 

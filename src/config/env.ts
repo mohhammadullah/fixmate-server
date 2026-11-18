@@ -62,7 +62,7 @@ const envSchema = z.object({
   // Overridable for a local mock of the Stripe API in tests. Never set in
   // production.
   STRIPE_API_BASE: z.string().url().optional(),
-  // Optional so the server and test suite can start without an ImgBB account.
+  // Optional ImgBB so the server and test suite can start without an ImgBB account.
   // The upload endpoint refuses requests with a safe 503 when it is missing.
   IMGBB_API_KEY: z.string().min(1).optional(),
   // Overridable for local/mock ImgBB responses in tests. Not a secret.
@@ -70,6 +70,16 @@ const envSchema = z.object({
     .string()
     .url()
     .default("https://api.imgbb.com/1/upload"),
+  // Optional platform tax rate applied to invoices, e.g. "0.05" for 5%.
+  // Leave unset/0 when no platform tax is configured. Applied on the
+  // discounted service amount; snapshotted into the immutable invoice.
+  INVOICE_TAX_RATE: z
+    .string()
+    .trim()
+    .regex(/^\d+(\.\d{1,4})?$/, "INVOICE_TAX_RATE must be a non-negative decimal")
+    .optional()
+    .transform((v) => (v === undefined ? 0 : Number(v)))
+    .refine((v) => Number.isFinite(v) && v >= 0 && v <= 0.9, "INVOICE_TAX_RATE must be between 0 and 0.9"),
 });
 
 const parsed = envSchema.safeParse(process.env);

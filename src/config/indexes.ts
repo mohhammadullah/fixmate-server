@@ -47,6 +47,17 @@ export const servicesIndexes: IndexDescription[] = [
 // 8.0.x supports partialFilterExpression for unique indexes. Enforced at
 // the database level, it cannot be bypassed by concurrent requests racing
 // past an application-level pre-check; violations surface as error 11000.
+// - Review subdocuments drive the public "latest reviews" feed (sorted by
+//   review.createdAt) and the service rating aggregations (filtered by
+//   serviceId). Both partial indexes only cover bookings that carry a
+//   review, so their size stays proportional to actual review volume.
+// - The schedule unique partial index is the authoritative guard against
+//   concurrent technician slot claims: two bookings for the same technician
+//   on the same date + hourly slot in an ACTIVE status cannot both exist.
+//   Combined with hourly (:00-aligned) slot enforcement, it eliminates
+//   double-booking even under races — violations surface as error 11000.
+// - The coupon partial index supports per-customer redemption-limit checks
+//   (count of this customer's coupon redemptions) without collection scans.
 export const bookingIndexes: IndexDescription[] = [
   {
     key: { customerId: 1, serviceId: 1 },
@@ -67,6 +78,39 @@ export const bookingIndexes: IndexDescription[] = [
   {
     key: { createdAt: -1 },
     name: "bookings_createdAt_-1",
+  },
+  {
+    key: { "review.createdAt": -1 },
+    name: "bookings_review_createdAt_-1",
+    partialFilterExpression: { review: { $exists: true } },
+  },
+  {
+    key: { serviceId: 1 },
+    name: "bookings_serviceId_1_review",
+    partialFilterExpression: { review: { $exists: true } },
+  },
+  // The homepage statistics and popular-services aggregations match on
+  // review.rating (existence + 1–5 bounds) across all reviewed bookings,
+  // with no serviceId/createdAt predicate — neither partial index above can
+  // serve that. This one keeps those scans bounded to reviewed bookings.
+  {
+    key: { "review.rating": 1 },
+    name: "bookings_review_rating_1",
+    partialFilterExpression: { review: { $exists: true } },
+  },
+  {
+    key: { technicianId: 1, "schedule.date": 1, "schedule.slotStart": 1 },
+    name: "bookings_technician_schedule_active_unique",
+    unique: true,
+    partialFilterExpression: {
+      schedule: { $exists: true },
+      status: { $in: [...ACTIVE_BOOKING_STATUSES] },
+    },
+  },
+  {
+    key: { customerId: 1, "appliedCoupon.code": 1 },
+    name: "bookings_customerId_1_couponCode_1",
+    partialFilterExpression: { appliedCoupon: { $exists: true } },
   },
 ];
 

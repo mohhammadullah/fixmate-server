@@ -9,6 +9,7 @@ import {
   listMyPayments,
   listTechnicianPayments,
 } from "../controllers/payment.controller.js";
+import { requestRefund } from "../controllers/refund.controller.js";
 
 const router = Router();
 
@@ -19,6 +20,7 @@ router.get("/my", verifyToken, verifyCustomer, listMyPayments);
 // completed bookings. Identity comes from the verified JWT; the role gate
 // is verifyTechnician. Customers and admins cannot reach it.
 router.get("/technician", verifyToken, verifyTechnician, listTechnicianPayments);
+router.post("/:paymentId/refunds", verifyToken, verifyCustomer, requestRefund);
 
 // No auth middleware: the Stripe signature is verified against the raw
 // request body (mounted ahead of express.json() in app.ts).

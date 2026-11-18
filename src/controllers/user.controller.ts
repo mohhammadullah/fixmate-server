@@ -27,6 +27,11 @@ const toProfileDto = (user: UserWithApplication) => ({
   updatedAt: dateOrNull(user.updatedAt),
   // Only the status is surfaced — no reviewer, reason or submitted details.
   technicianApplicationStatus: user.technicianApplication?.status ?? null,
+  // Coordinates are intentionally NOT returned; the DTO only reveals whether
+  // the user consented to location matching.
+  hasLocation: Boolean(
+    user.location && typeof user.location === "object"
+  ),
 });
 
 // GET /api/users/me — any authenticated user, identified only by JWT.
@@ -49,6 +54,7 @@ export const getMyProfile = async (
       projection: {
         name: 1, email: 1, role: 1, phone: 1, area: 1, bio: 1,
         createdAt: 1, updatedAt: 1, "technicianApplication.status": 1,
+        location: 1,
       },
     }
   );
@@ -88,7 +94,7 @@ export const updateMyProfile = async (
     return;
   }
 
-  const { name, phone, area, bio } = parsed.data;
+  const { name, phone, area, bio, location } = parsed.data;
   const set: Record<string, unknown> = { updatedAt: new Date() };
   if (name !== undefined) set.name = name;
   // Empty strings are allowed to clear optional profile fields on the model;
@@ -96,6 +102,19 @@ export const updateMyProfile = async (
   if (phone !== undefined) set.phone = phone;
   if (area !== undefined) set.area = area;
   if (bio !== undefined) set.bio = bio;
+  if (location !== undefined) {
+    const cleaned: { area?: string; coordinates?: { lat: number; lng: number } } = {};
+    if (location.area !== undefined) {
+      cleaned.area = location.area.trim();
+    }
+    if (location.coordinates !== undefined) {
+      cleaned.coordinates = {
+        lat: Math.round(location.coordinates.lat * 1e5) / 1e5,
+        lng: Math.round(location.coordinates.lng * 1e5) / 1e5,
+      };
+    }
+    set.location = cleaned;
+  }
 
   const updated = await getUsersCollection().findOneAndUpdate(
     { _id: userId },

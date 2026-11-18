@@ -1,7 +1,14 @@
 
 import type { Collection, ObjectId } from "mongodb";
 import { getDB } from "../config/db.js";
-import type { ServiceCategory } from "./service.model.js";
+import type { AnyServiceCategory } from "./service.model.js";
+import type {
+  BookingSchedule,
+  BookingTimelineEvent,
+  BookingConversation,
+  BookingInvoice,
+  AppliedCoupon,
+} from "./booking-extras.model.js";
 
 export const BOOKINGS_COLLECTION = "bookings";
 
@@ -31,6 +38,16 @@ export const PAYMENT_STATUSES = ["unpaid", "paid", "refunded"] as const;
 
 export type PaymentStatus = (typeof PAYMENT_STATUSES)[number];
 
+// A customer review of a completed booking. Reviews are stored as a
+// subdocument on the booking itself — no separate reviews collection exists.
+// Rating is a whole number from 1 to 5; the comment is validated by
+// createReviewSchema (see validators/review.validator.ts).
+export interface BookingReview {
+  rating: number;
+  comment: string;
+  createdAt: Date;
+}
+
 export interface Booking {
   _id: ObjectId;
   serviceId: ObjectId;
@@ -43,7 +60,7 @@ export interface Booking {
   technicianName: string;
   technicianEmail: string;
   serviceTitle: string;
-  serviceCategory: ServiceCategory;
+  serviceCategory: AnyServiceCategory;
   serviceLocation: string;
   serviceImage: string;
   hourlyRate: number;
@@ -55,6 +72,18 @@ export interface Booking {
   // Settled only when the job is completed (final price agreed after work);
   // absent at creation time.
   finalAmount?: number;
+  // Customer review for this booking. Absent until the owning customer
+  // submits one; at most one review exists per booking. Only completed
+  // bookings may carry a review.
+  review?: BookingReview;
+  // --- Scheduling / tracking / messaging / invoicing extensions ---
+  // All optional: existing bookings without them remain valid (backward
+  // compatible). See models/booking-extras.model.ts for bounds.
+  schedule?: BookingSchedule;
+  timeline?: BookingTimelineEvent[];
+  conversation?: BookingConversation;
+  invoice?: BookingInvoice;
+  appliedCoupon?: AppliedCoupon;
   createdAt: Date;
   updatedAt: Date;
 }

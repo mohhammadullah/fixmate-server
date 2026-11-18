@@ -16,12 +16,22 @@ import {
 } from "../validators/payment.validator.js";
 import { getBookingsCollection, type Booking } from "../models/booking.model.js";
 import {
+  canonicalizeCategory,
+  type ServiceCategory,
+} from "../models/service.model.js";
+import {
   getPaymentsCollection,
   PAYMENTS_COLLECTION,
   type Payment,
   type PaymentStatus,
 } from "../models/payment.model.js";
 import { toMinorUnits, fromMinorUnits } from "../utils/currency.js";
+import { ensureInvoiceForBooking, setInvoicePaymentStatus } from "../utils/invoice.js";
+import { emitBookingEvent } from "../utils/booking-events.js";
+import {
+  claimCouponRedemption,
+  releaseCouponUsageSlot,
+} from "./coupon.controller.js";
 
 // MongoDB duplicate-key error (unique index violation), matched by code so
 // it works regardless of which unique index was violated and without
@@ -84,6 +94,10 @@ interface CheckoutSessionDTO {
   amount: number;
   currency: string;
   bookingId: string;
+  appliedCoupon?: {
+    code: string;
+    discountAmount: number;
+  };
 }
 
 const toCheckoutSessionDTO = (payment: Payment): CheckoutSessionDTO => {
@@ -100,6 +114,13 @@ const toCheckoutSessionDTO = (payment: Payment): CheckoutSessionDTO => {
 
   if (payment.expiresAt) {
     dto.expiresAt = payment.expiresAt;
+  }
+
+  if (payment.appliedCoupon) {
+    dto.appliedCoupon = {
+      code: payment.appliedCoupon.code,
+      discountAmount: payment.appliedCoupon.discountAmount,
+    };
   }
 
   return dto;
@@ -234,10 +255,11 @@ export const createCheckoutSession = async (
     return;
   }
 
+  const couponCode = parsed.data.couponCode;
   const currency = stripeCurrency;
-  const amount = toMinorUnits(finalAmount, currency);
+  const fullAmount = toMinorUnits(finalAmount, currency);
 
-  if (!Number.isSafeInteger(amount) || amount <= 0) {
+  if (!Number.isSafeInteger(fullAmount) || fullAmount <= 0) {
     res.status(500).json({
       success: false,
       message: "Unable to price this booking. Please contact support.",
@@ -252,6 +274,62 @@ export const createCheckoutSession = async (
     bookingId,
     status: "pending",
   });
+
+  if (couponCode && existing?.checkoutUrl) {
+    // A pending session already locks in its (possibly coupon-less) price;
+    // Stripe cannot be updated to add a discount. Tell the customer to
+    // finish or wait for expiry instead of charging a mismatched amount.
+    res.status(409).json({
+      success: false,
+      message:
+        "A checkout is already in progress for this booking. Complete it or wait for it to expire, then apply the coupon.",
+    });
+    return;
+  }
+
+  // Coupon: validate + atomically claim a redemption slot BEFORE any Stripe
+  // work. The discount is computed entirely server-side from finalAmount.
+  let appliedCoupon: Payment["appliedCoupon"] | undefined;
+  let claimResult: Awaited<ReturnType<typeof claimCouponRedemption>> | undefined;
+  if (couponCode && !existing) {
+    claimResult = await claimCouponRedemption(
+      couponCode,
+      finalAmount,
+      currency,
+      customerId,
+      canonicalizeCategory(booking.serviceCategory) ??
+        (booking.serviceCategory as ServiceCategory)
+    );
+    if (!claimResult.ok) {
+      res.status(400).json({ success: false, message: claimResult.message });
+      return;
+    }
+    appliedCoupon = {
+      code: claimResult.coupon.code,
+      kind: claimResult.coupon.kind,
+      value: claimResult.coupon.value,
+      discountAmount: claimResult.discount,
+      currency,
+      appliedAt: new Date(),
+    };
+  }
+
+  const amount = appliedCoupon
+    ? toMinorUnits(Math.max(0.01, Math.round((finalAmount - appliedCoupon.discountAmount) * 100) / 100), currency)
+    : fullAmount;
+
+  if (!Number.isSafeInteger(amount) || amount <= 0) {
+    // Roll back the claimed slot before failing — the customer is never
+    // charged and never charged a negative amount.
+    if (claimResult?.ok) {
+      await releaseCouponUsageSlot(couponCode!);
+    }
+    res.status(500).json({
+      success: false,
+      message: "Unable to price this booking. Please contact support.",
+    });
+    return;
+  }
 
   if (existing?.checkoutUrl) {
     if (!existing.expiresAt || existing.expiresAt.getTime() > Date.now()) {
@@ -305,6 +383,7 @@ export const createCheckoutSession = async (
     amount,
     currency,
     status: "pending",
+    ...(appliedCoupon ? { appliedCoupon } : {}),
     createdAt: now,
     updatedAt: now,
   };
@@ -313,6 +392,10 @@ export const createCheckoutSession = async (
     await getPaymentsCollection().insertOne(placeholder);
   } catch (error) {
     if (isDuplicateKeyError(error)) {
+      // Reuse the winner's in-flight session — release our redundant slot.
+      if (claimResult?.ok && couponCode) {
+        await releaseCouponUsageSlot(couponCode).catch(() => undefined);
+      }
       const ready = await waitForCheckoutUrl(bookingId);
 
       if (ready) {
@@ -331,6 +414,9 @@ export const createCheckoutSession = async (
       return;
     }
 
+    if (claimResult?.ok && couponCode) {
+      await releaseCouponUsageSlot(couponCode).catch(() => undefined);
+    }
     throw error;
   }
 
@@ -369,6 +455,10 @@ export const createCheckoutSession = async (
       .deleteOne({ _id: paymentId, status: "pending" })
       .catch(() => undefined);
 
+    if (claimResult?.ok && couponCode) {
+      await releaseCouponUsageSlot(couponCode).catch(() => undefined);
+    }
+
     // Log only the message — never keys, never full provider responses.
     console.error(
       "Stripe checkout session creation failed:",
@@ -386,6 +476,10 @@ export const createCheckoutSession = async (
     await getPaymentsCollection()
       .deleteOne({ _id: paymentId, status: "pending" })
       .catch(() => undefined);
+
+    if (claimResult?.ok && couponCode) {
+      await releaseCouponUsageSlot(couponCode).catch(() => undefined);
+    }
 
     console.error("Stripe returned a checkout session without id or url.");
     res.status(502).json({
@@ -420,6 +514,9 @@ export const createCheckoutSession = async (
   if (!recorded) {
     // The claim vanished between insert and update (e.g. rolled back
     // externally). Never hand out a session we cannot track.
+    if (claimResult?.ok && couponCode) {
+      await releaseCouponUsageSlot(couponCode).catch(() => undefined);
+    }
     console.error(
       `[payments] pending claim ${paymentId.toHexString()} vanished before it could be recorded`
     );
@@ -429,6 +526,21 @@ export const createCheckoutSession = async (
         "Couldn't create a secure checkout session right now. Please try again.",
     });
     return;
+  }
+
+  // Best-effort mirror of the coupon snapshot onto the booking so the
+  // invoice layer can read it later. Failures here never fail checkout —
+  // the payment document carries the same data and the webhook derives
+  // everything from there.
+  if (appliedCoupon) {
+    try {
+      await getBookingsCollection().updateOne(
+        { _id: bookingId, paymentStatus: "unpaid" },
+        { $set: { appliedCoupon, updatedAt: new Date() } }
+      );
+    } catch (error) {
+      console.error("appliedCoupon booking update failed:", error);
+    }
   }
 
   res.status(201).json({
@@ -867,6 +979,11 @@ const settlePendingPayment = async (
 
 // Reconciles a completed Checkout Session against the stored payment
 // record before anything is marked paid:
+//   0. the session must report payment_status "paid" — for asynchronous
+//      payment methods (bank debits, BNPL, …) `checkout.session.completed`
+//      fires BEFORE the money moves. Those sessions stay pending until
+//      `checkout.session.async_payment_succeeded` carries payment_status
+//      "paid" (or async_payment_failed retires the pending record).
 //   1. the session id must be one we recorded;
 //   2. the session metadata booking reference, amount and currency must
 //      match our record exactly;
@@ -875,12 +992,78 @@ const settlePendingPayment = async (
 //   4. the payment record must still be pending (double delivery is a
 //      no-op; the booking is reconciled as a self-heal).
 // Mismatches mark the payment failed and leave the booking untouched.
+// charge.refunded — reconcile embedded refund records with Stripe's truth.
+// Updates invoice/refund status only; never touches amounts. Idempotent:
+// conditional arrayFilters keep re-deliveries harmless.
+const settleRefundedCharge = async (charge: Stripe.Charge): Promise<void> => {
+  const rawIntent = charge.payment_intent;
+  const paymentIntentId =
+    typeof rawIntent === "string" ? rawIntent : rawIntent?.id;
+  if (!paymentIntentId) return;
+
+  const payment = await getPaymentsCollection().findOne({
+    stripePaymentIntentId: paymentIntentId,
+  });
+  if (!payment) return;
+
+  const chargeRefunds =
+    (charge as { refunds?: { data?: Array<{ id: string; status?: string }> } })
+      .refunds?.data ?? [];
+  const confirmedIds = chargeRefunds
+    .filter((refund) => refund.status === "succeeded")
+    .map((refund) => refund.id);
+
+  if (confirmedIds.length > 0) {
+    await getPaymentsCollection().updateOne(
+      { _id: payment._id },
+      {
+        $set: {
+          "refunds.$[r].status": "succeeded",
+          updatedAt: new Date(),
+        },
+      },
+      {
+        arrayFilters: [
+          {
+            "r.stripeRefundId": { $in: confirmedIds },
+            "r.status": { $in: ["pending", "failed"] },
+          },
+        ],
+      }
+    );
+  }
+
+  const amountRefunded =
+    typeof charge.amount_refunded === "number" ? charge.amount_refunded : 0;
+  if (amountRefunded >= payment.amount) {
+    await getBookingsCollection().updateOne(
+      { _id: payment.bookingId, paymentStatus: { $ne: "refunded" } },
+      { $set: { paymentStatus: "refunded", updatedAt: new Date() } }
+    );
+    await setInvoicePaymentStatus(payment.bookingId, "refunded");
+    return;
+  }
+
+  // Partial refund — keep the payment status, flag the invoice.
+  await setInvoicePaymentStatus(payment.bookingId, "partially_refunded");
+};
+
 const settleCompletedSession = async (
   session: Stripe.Checkout.Session
 ): Promise<void> => {
   const sessionId = toHexOrNull(session?.id);
 
   if (!sessionId) {
+    return;
+  }
+
+  // Stripe does not consider the money "paid" for asynchronous methods at
+  // the time `completed` fires. Never mark anything paid on that basis —
+  // acknowledge and wait for async_payment_succeeded / async_payment_failed.
+  if (session.payment_status !== "paid") {
+    console.log(
+      `[payments] session ${sessionId} completed with payment_status "${session.payment_status ?? "unknown"}" — left pending until the asynchronous payment settles`
+    );
     return;
   }
 
@@ -896,6 +1079,9 @@ const settleCompletedSession = async (
 
   const metadata = session.metadata ?? undefined;
   const sessionBookingId = toHexOrNull(metadata?.bookingId);
+  const clientReferenceId = toHexOrNull(
+    (session as { client_reference_id?: unknown }).client_reference_id
+  );
   const sessionAmount =
     typeof session.amount_total === "number" ? session.amount_total : null;
   const sessionCurrency =
@@ -904,6 +1090,12 @@ const settleCompletedSession = async (
   const mismatches: string[] = [];
 
   if (sessionBookingId !== payment.bookingId.toHexString()) {
+    mismatches.push("booking");
+  }
+
+  // Cross-check the session's own booking reference against the recorded
+  // payment — both must agree, belt and braces on top of metadata.
+  if (clientReferenceId && clientReferenceId !== payment.bookingId.toHexString()) {
     mismatches.push("booking");
   }
 
@@ -930,10 +1122,20 @@ const settleCompletedSession = async (
     _id: payment.bookingId,
   });
 
-  const expectedMinor =
+  // Reconcile against the amount we actually charged: the booking's final
+  // amount, less any coupon discount this payment carries. The payment's
+  // stored `amount` is authoritative for what left the customer's account.
+  const appliedDiscount =
+    payment.appliedCoupon && typeof payment.appliedCoupon.discountAmount === "number"
+      ? payment.appliedCoupon.discountAmount
+      : 0;
+  const expectedMajor =
     booking && typeof booking.finalAmount === "number" && Number.isFinite(booking.finalAmount)
-      ? toMinorUnits(booking.finalAmount, payment.currency)
+      ? Math.max(0.01, Math.round((booking.finalAmount - appliedDiscount) * 100) / 100)
       : null;
+
+  const expectedMinor =
+    expectedMajor !== null ? toMinorUnits(expectedMajor, payment.currency) : null;
 
   if (
     !booking ||
@@ -966,29 +1168,46 @@ const settleCompletedSession = async (
     { returnDocument: "after" }
   );
 
-  if (!claimed) {
-    // Already settled (Stripe redelivered the event). Reconcile the
-    // booking defensively in case a previous attempt died between the
-    // payment update and the booking update.
-    await getBookingsCollection().updateOne(
-      { _id: payment.bookingId, paymentStatus: "unpaid" },
-      { $set: { paymentStatus: "paid", updatedAt: paidAt } }
-    );
-    return;
-  }
-
-  await getBookingsCollection().updateOne(
+  // Reconcile the booking defensively in case a previous attempt died
+  // between the payment update and the booking update. Only the delivery
+  // that actually flips the booking runs the post-payment fan-out
+  // (invoice issuance + timeline/notification), so Stripe redeliveries are
+  // idempotent.
+  const flip = await getBookingsCollection().updateOne(
     { _id: payment.bookingId, paymentStatus: "unpaid" },
     { $set: { paymentStatus: "paid", updatedAt: paidAt } }
   );
+
+  if (flip.modifiedCount === 0) {
+    // Booking was already marked paid — nothing else to do.
+    return;
+  }
+
+  try {
+    const freshBooking = await getBookingsCollection().findOne({
+      _id: payment.bookingId,
+    });
+    if (freshBooking) {
+      await ensureInvoiceForBooking(freshBooking._id, claimed ?? undefined);
+      await emitBookingEvent(freshBooking, "payment_confirmed", "system");
+    }
+  } catch (error) {
+    // Never let post-payment bookkeeping fail the webhook — Stripe would
+    // retry otherwise, and the booking is already correctly marked paid.
+    console.error("Post-payment invoice/notification error:", error);
+  }
 };
 
 // POST /api/payments/webhook — no auth middleware; the Stripe signature is
-// verified against the raw request body with STRIPE_WEBHOOK_SECRET. Always
-// answers 200 for handled (and uninteresting) events; 400 only for a
-// missing signature or raw-body misconfiguration, and 503 when the webhook
-// secret is not configured. Processing failures answer 500 so Stripe
-// retries — the handler is idempotent.
+// verified against the raw request body with STRIPE_WEBHOOK_SECRET. Handled
+// events: checkout.session.completed, checkout.session.async_payment_succeeded,
+// checkout.session.async_payment_failed, checkout.session.expired. A
+// `completed` (or `async_payment_succeeded`) session only settles the
+// payment when Stripe reports payment_status "paid". Always answers 200 for
+// handled (and uninteresting) events; 400 only for a missing signature or
+// raw-body misconfiguration, and 503 when the webhook secret is not
+// configured. Processing failures answer 500 so Stripe retries — the
+// handler is idempotent.
 export const handleStripeWebhook = async (
   req: Request,
   res: Response
@@ -1043,6 +1262,15 @@ export const handleStripeWebhook = async (
           event.data.object as Stripe.Checkout.Session
         );
         break;
+      case "checkout.session.async_payment_succeeded":
+        // Asynchronous payment methods (bank debits, BNPL, …) report the
+        // money as moved only here. The settlement path is identical —
+        // and it re-checks amount, currency, booking and ownership, so a
+        // forged or mismatched session can never mark the booking paid.
+        await settleCompletedSession(
+          event.data.object as Stripe.Checkout.Session
+        );
+        break;
       case "checkout.session.expired":
         await settlePendingPayment(
           event.data.object as Stripe.Checkout.Session,
@@ -1054,6 +1282,9 @@ export const handleStripeWebhook = async (
           event.data.object as Stripe.Checkout.Session,
           "failed"
         );
+        break;
+      case "charge.refunded":
+        await settleRefundedCharge(event.data.object as Stripe.Charge);
         break;
       default:
         // Uninteresting event types are acknowledged and ignored.

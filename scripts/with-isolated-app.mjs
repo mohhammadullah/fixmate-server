@@ -67,12 +67,15 @@ const main = async () => {
   const { ensureIndexes } = await import("../dist/config/indexes.js");
   const { createAuth } = await import("../dist/config/auth.js");
   const { createApp } = await import("../dist/app.js");
+  const { initSocketServer, closeSocketServer } = await import("../dist/socket.js");
 
   await connectDB();
   await ensureIndexes();
 
   const app = createApp(createAuth());
   const server = http.createServer(app);
+  // Attach the Socket.IO layer so socket-aware suites can exercise it too.
+  initSocketServer(server);
 
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -99,6 +102,7 @@ const main = async () => {
     process.exitCode = code;
   } finally {
     await new Promise((resolve) => server.close(resolve));
+    await closeSocketServer().catch(() => undefined);
     await closeDB();
   }
 };

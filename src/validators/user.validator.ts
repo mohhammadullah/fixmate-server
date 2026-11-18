@@ -28,6 +28,31 @@ export const updateProfileSchema = z
       .optional(),
     area: optionalTrimmed(120, "Area"),
     bio: optionalTrimmed(1000, "Bio"),
+    // Approximate location — stored only with explicit user consent. Never
+    // exposed publicly; used for area/distance matching server-side.
+    location: z
+      .strictObject({
+        area: z.string({ error: "Area must be a string" }).trim().max(120).optional(),
+        coordinates: z
+          .strictObject({
+            lat: z
+              .number({ error: "lat must be a number" })
+              .min(-90, "lat must be between -90 and 90")
+              .max(90, "lat must be between -90 and 90"),
+            lng: z
+              .number({ error: "lng must be a number" })
+              .min(-180, "lng must be between -180 and 180")
+              .max(180, "lng must be between -180 and 180"),
+          })
+          .refine((value) => Number.isFinite(value.lat) && Number.isFinite(value.lng), {
+            message: "coordinates must be finite numbers",
+          })
+          .optional(),
+      })
+      .refine((value) => value.area !== undefined || value.coordinates !== undefined, {
+        message: "location requires at least an area or coordinates",
+      })
+      .optional(),
   })
   .refine((data) => Object.keys(data).length > 0, {
     message: "Provide at least one field to update",

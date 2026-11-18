@@ -28,10 +28,12 @@ const positiveIntQuerySchema = (label: string, max?: number) => {
   ).optional();
 };
 
-// Checkout session creation accepts the booking reference ONLY. Amount,
-// currency, customer identity, payment status and any other field are
-// server-controlled and deliberately absent: z.strictObject rejects any
-// key outside this shape.
+// Checkout session creation accepts the booking reference and (optionally) a
+// coupon code. Amount, currency, customer identity, payment status and any
+// other field are server-controlled and deliberately absent: z.strictObject
+// rejects any key outside this shape. The coupon is re-validated and
+// re-computed server-side during session creation — never trusted from the
+// client.
 export const checkoutSessionSchema = z.strictObject({
   bookingId: z
     .string({ error: "bookingId is required and must be a string" })
@@ -40,6 +42,13 @@ export const checkoutSessionSchema = z.strictObject({
       OBJECT_ID_HEX_REGEX,
       "bookingId must be a 24-character hexadecimal ObjectId"
     ),
+  couponCode: z
+    .string({ error: "couponCode must be a string" })
+    .trim()
+    .min(3, "couponCode is too short")
+    .max(32, "couponCode is too long")
+    .transform((value) => value.toUpperCase())
+    .optional(),
 });
 
 // Technician payment-history query. `status=paid|unpaid` splits the two

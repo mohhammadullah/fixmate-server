@@ -3,13 +3,27 @@ import type { Response } from "express";
 import { ObjectId, type Filter, type Sort } from "mongodb";
 import { getDB } from "../config/db.js";
 import type { AuthenticatedRequest } from "../middleware/verifyToken.js";
-import { createBookingSchema, listBookingsQuerySchema, updateBookingStatusSchema, cancelBookingSchema, OBJECT_ID_HEX_REGEX } from "../validators/booking.validator.js";
+import { listBookingsQuerySchema, updateBookingStatusSchema, cancelBookingSchema, OBJECT_ID_HEX_REGEX } from "../validators/booking.validator.js";
+import { createBookingWithScheduleSchema } from "../validators/features.validator.js";
+import { createReviewSchema } from "../validators/review.validator.js";
 import {
   getBookingsCollection,
   ACTIVE_BOOKING_STATUSES,
   type Booking,
+  type BookingReview,
 } from "../models/booking.model.js";
 import { getServicesCollection } from "../models/service.model.js";
+import { emitBookingEvent } from "../utils/booking-events.js";
+import {
+  SLOT_DURATION_MINUTES,
+  isSlotInPast,
+  isSlotTooFarAhead,
+  validateScheduleShape,
+  validateTechnicianSlot,
+  findConflictingBooking,
+  addMinutes,
+} from "../utils/schedule.js";
+import { toPublicTimeline } from "../utils/timeline.js";
 
 // Better Auth's MongoDB adapter stores users in the singular `user`
 // collection with `_id` as an ObjectId; the JWT's `id` claim is the
@@ -85,11 +99,63 @@ interface BookingDetailsDTO {
   paymentStatus: Booking["paymentStatus"];
   // Settled only when the job is completed; omitted until then.
   finalAmount?: number;
+  // The customer's own review of this booking, when they have submitted one.
+  review?: {
+    rating: number;
+    comment: string;
+    createdAt: Date;
+  };
+  // Optional appointment schedule (backwards compatible).
+  schedule?: {
+    date: string;
+    slotStart: string;
+    slotEnd: string;
+    durationMinutes: number;
+    timezone: string;
+  };
+  // Server-written timeline events (never client-authored).
+  timeline?: import("../utils/timeline.js").PublicTimelineEvent[];
+  // Unread messages for the viewing participant.
+  chatUnread?: number;
+  // Invoice snapshot when issued (completed bookings only).
+  invoice?: {
+    number: string;
+    issuedAt: Date;
+    currency: string;
+    serviceAmount: number;
+    discountAmount: number;
+    discountCode?: string;
+    taxAmount: number;
+    totalAmount: number;
+    paymentStatus: string;
+    paidAt?: Date;
+    bookingReference: string;
+  };
   createdAt: Date;
   updatedAt: Date;
 }
 
-const toBookingDetailsDTO = (booking: Booking): BookingDetailsDTO => {
+const toPublicInvoice = (invoice: Booking["invoice"]) =>
+  invoice
+    ? {
+        number: invoice.number,
+        issuedAt: invoice.issuedAt,
+        currency: invoice.currency,
+        serviceAmount: invoice.serviceAmount,
+        discountAmount: invoice.discountAmount,
+        ...(invoice.discountCode ? { discountCode: invoice.discountCode } : {}),
+        taxAmount: invoice.taxAmount,
+        totalAmount: invoice.totalAmount,
+        paymentStatus: invoice.paymentStatus,
+        ...(invoice.paidAt ? { paidAt: invoice.paidAt } : {}),
+        bookingReference: invoice.bookingReference,
+      }
+    : undefined;
+
+const toBookingDetailsDTO = (
+  booking: Booking,
+  viewer?: { id: string; role: string }
+): BookingDetailsDTO => {
   const dto: BookingDetailsDTO = {
     id: booking._id.toHexString(),
     service: {
@@ -112,6 +178,40 @@ const toBookingDetailsDTO = (booking: Booking): BookingDetailsDTO => {
 
   if (booking.finalAmount !== undefined) {
     dto.finalAmount = booking.finalAmount;
+  }
+
+  if (booking.review) {
+    dto.review = {
+      rating: booking.review.rating,
+      comment: booking.review.comment,
+      createdAt: booking.review.createdAt,
+    };
+  }
+
+  if (booking.schedule) {
+    dto.schedule = {
+      date: booking.schedule.date,
+      slotStart: booking.schedule.slotStart,
+      slotEnd: booking.schedule.slotEnd,
+      durationMinutes: booking.schedule.durationMinutes,
+      timezone: booking.schedule.timezone,
+    };
+  }
+
+  if (Array.isArray(booking.timeline) && booking.timeline.length > 0) {
+    dto.timeline = toPublicTimeline(booking.timeline);
+  }
+
+  if (booking.invoice) {
+    dto.invoice = toPublicInvoice(booking.invoice);
+  }
+
+  if (viewer) {
+    const messages = booking.conversation?.messages ?? [];
+    dto.chatUnread = messages.filter(
+      (message) =>
+        message.senderId.toHexString() !== viewer.id && !message.readAt
+    ).length;
   }
 
   return dto;
@@ -143,7 +243,7 @@ export const createBooking = async (
     return;
   }
 
-  const parsed = createBookingSchema.safeParse(req.body);
+  const parsed = createBookingWithScheduleSchema.safeParse(req.body);
 
   if (!parsed.success) {
     res.status(400).json({
@@ -244,6 +344,75 @@ export const createBooking = async (
     return;
   }
 
+  // --- Optional appointment schedule ---
+  // Backward compatible: bookings without a schedule behave exactly as
+  // before. When provided, every rule is validated server-side and the
+  // unique partial index bookings_technician_schedule_active_unique is the
+  // authoritative guard against concurrent slot claims.
+  let schedule: import("../models/booking-extras.model.js").BookingSchedule | undefined;
+  if (parsed.data.schedule) {
+    const { date, slotStart, timezone } = parsed.data.schedule;
+    const shapeError = validateScheduleShape({ date, slotStart, timezone });
+    if (shapeError) {
+      res.status(400).json({ success: false, message: shapeError.message });
+      return;
+    }
+    if (isSlotTooFarAhead(date, timezone)) {
+      res.status(400).json({
+        success: false,
+        message: "Appointments can be scheduled at most 60 days ahead.",
+      });
+      return;
+    }
+    if (isSlotInPast(date, slotStart, timezone)) {
+      res.status(400).json({
+        success: false,
+        message: "Cannot schedule an appointment in the past.",
+      });
+      return;
+    }
+
+    // Technician availability (fresh DB read — never from the client).
+    const technicianDoc = await getDB()
+      .collection(USERS_COLLECTION)
+      .findOne(
+        { _id: service.technicianId },
+        { projection: { availability: 1 } }
+      );
+    const slotError = validateTechnicianSlot(
+      technicianDoc?.availability as import("../models/user-config.model.js").TechnicianAvailability | undefined,
+      date,
+      slotStart
+    );
+    if (slotError) {
+      res.status(409).json({ success: false, message: slotError.message });
+      return;
+    }
+
+    const conflict = await findConflictingBooking(service.technicianId, date, slotStart);
+    if (conflict) {
+      res.status(409).json({
+        success: false,
+        message: "That time slot was just taken for this technician. Please pick another slot.",
+      });
+      return;
+    }
+
+    const slotEnd = addMinutes(slotStart, SLOT_DURATION_MINUTES);
+    if (!slotEnd) {
+      res.status(400).json({ success: false, message: "Appointment slot crosses midnight." });
+      return;
+    }
+
+    schedule = {
+      date,
+      slotStart,
+      slotEnd,
+      durationMinutes: SLOT_DURATION_MINUTES,
+      timezone,
+    };
+  }
+
   const now = new Date();
 
   const booking: Booking = {
@@ -266,19 +435,34 @@ export const createBooking = async (
     paymentStatus: "unpaid",
     createdAt: now,
     updatedAt: now,
+    ...(schedule ? { schedule } : {}),
   };
 
   try {
     await getBookingsCollection().insertOne(booking);
   } catch (error) {
     if (isDuplicateKeyError(error)) {
+      // Distinguish the schedule-slot partial unique index from the
+      // customer-services duplicate index so the message is accurate.
+      const keyValue = (error as { keyValue?: Record<string, unknown> }).keyValue ?? {};
+      const isSlotConflict = "schedule.date" in keyValue || "schedule.slotStart" in keyValue;
       res.status(409).json({
         success: false,
-        message: DUPLICATE_BOOKING_MESSAGE,
+        message: isSlotConflict
+          ? "That time slot was just taken for this technician. Please pick another slot."
+          : DUPLICATE_BOOKING_MESSAGE,
       });
       return;
     }
     throw error;
+  }
+
+  // Post-commit fan-out: timeline + notification (best effort, never
+  // blocks the response).
+  try {
+    await emitBookingEvent(booking, "requested", "customer");
+  } catch (error) {
+    console.error("createBooking: post-commit event error:", error);
   }
 
   res.status(201).json({
@@ -342,11 +526,16 @@ export const listTechnicianBookings = async (
     filter.status = { $ne: "cancelled" };
   }
 
+  // Project away the potentially large embedded documents — list views
+  // never need the conversation, timeline or invoice snapshot. The detail
+  // endpoint returns those.
+  const LIST_PROJECTION = { conversation: 0, timeline: 0, invoice: 0 } as const;
+
   // MongoDB errors propagate to Express 5, which forwards them to the
   // existing errorHandler middleware.
   const [items, totalItems] = await Promise.all([
     getBookingsCollection()
-      .find(filter)
+      .find(filter, { projection: LIST_PROJECTION })
       .sort(BOOKING_SORT)
       .skip((page - 1) * limit)
       .limit(limit)
@@ -458,6 +647,17 @@ const transitionRequestedBooking = async (
   if (!updated) {
     await respondAfterFailedTransition(res, bookingId, { technicianId });
     return;
+  }
+
+  // Timeline + notification after a successful authorized transition.
+  try {
+    await emitBookingEvent(
+      updated,
+      targetStatus === "accepted" ? "accepted" : "rejected",
+      "technician"
+    );
+  } catch (error) {
+    console.error(`accept/reject: post-commit event error (${targetStatus}):`, error);
   }
 
   res.status(200).json({
@@ -583,6 +783,17 @@ export const updateBookingStatus = async (
     return;
   }
 
+  try {
+    const timelineType = parsed.data.status === "in-progress" ? "started" : "completed";
+    const note =
+      parsed.data.status === "completed" && typeof updated.finalAmount === "number"
+        ? `final amount ${updated.finalAmount}`
+        : undefined;
+    await emitBookingEvent(updated, timelineType, "technician", note);
+  } catch (error) {
+    console.error("updateBookingStatus: post-commit event error:", error);
+  }
+
   res.status(200).json({
     success: true,
     message: transition.message,
@@ -645,11 +856,16 @@ export const listMyBookings = async (
     filter.status = { $ne: "cancelled" };
   }
 
+  // Project away the potentially large embedded documents — list views
+  // never need the conversation, timeline or invoice snapshot. The detail
+  // endpoint returns those.
+  const LIST_PROJECTION = { conversation: 0, timeline: 0, invoice: 0 } as const;
+
   // MongoDB errors propagate to Express 5, which forwards them to the
   // existing errorHandler middleware.
   const [items, totalItems] = await Promise.all([
     getBookingsCollection()
-      .find(filter)
+      .find(filter, { projection: LIST_PROJECTION })
       .sort(BOOKING_SORT)
       .skip((page - 1) * limit)
       .limit(limit)
@@ -740,6 +956,12 @@ export const cancelBooking = async (
     return;
   }
 
+  try {
+    await emitBookingEvent(updated, "cancelled", "customer");
+  } catch (error) {
+    console.error("cancelBooking: post-commit event error:", error);
+  }
+
   res.status(200).json({
     success: true,
     message: "Booking cancelled successfully.",
@@ -803,6 +1025,130 @@ export const getBookingDetails = async (
 
   res.status(200).json({
     success: true,
-    data: toBookingDetailsDTO(booking),
+    data: toBookingDetailsDTO(booking, req.user ? { id: req.user.id, role: req.user.role } : undefined),
+  });
+};
+
+// POST /api/bookings/:id/review — customer only (verifyToken -> verifyCustomer).
+//
+// Review eligibility and security, all enforced server-side:
+//   - Identity comes exclusively from the verified JWT (req.user); any
+//     customerId/technicianId/serviceId in the body is rejected by the
+//     strict validator and never read.
+//   - Only the customer who owns the booking may review it. The atomic
+//     update filter includes { _id, customerId }, so another customer's
+//     booking is indistinguishable from a missing one (404 either way).
+//   - Only completed bookings are eligible; the filter requires
+//     status: "completed", enforced atomically at write time.
+//   - One review per booking: the filter requires review $exists: false, so
+//     a second submission matches nothing and is rejected with 409.
+//   - Technicians and admins never reach this handler (verifyCustomer).
+// The post-failure lookup runs only after the atomic update matched nothing;
+// it distinguishes 404 (no such booking for this customer) from 409 (not
+// completed / already reviewed) and never authorizes a write.
+export const submitReview = async (
+  req: AuthenticatedRequest,
+  res: Response
+): Promise<void> => {
+  if (!req.user) {
+    res.status(401).json({
+      success: false,
+      message: "Authentication token is required.",
+    });
+    return;
+  }
+
+  const customerId = resolveAuthUserId(req);
+
+  if (!customerId) {
+    res.status(401).json({
+      success: false,
+      message: "Invalid token payload.",
+    });
+    return;
+  }
+
+  const { id } = req.params;
+  const bookingId = parseParamId(id);
+
+  if (!bookingId) {
+    res.status(400).json({
+      success: false,
+      message: "Invalid booking id.",
+    });
+    return;
+  }
+
+  const parsed = createReviewSchema.safeParse(req.body ?? {});
+
+  if (!parsed.success) {
+    res.status(400).json({
+      success: false,
+      message: "Validation failed.",
+      errors: parsed.error.issues.map((issue) => ({
+        field: issue.path.join("."),
+        message: issue.message,
+      })),
+    });
+    return;
+  }
+
+  const now = new Date();
+  const review: BookingReview = {
+    rating: parsed.data.rating,
+    comment: parsed.data.comment,
+    createdAt: now,
+  };
+
+  // Atomic transition: the review is written iff the booking is owned by this
+  // customer, completed, and carries no review yet.
+  const updated = await getBookingsCollection().findOneAndUpdate(
+    {
+      _id: bookingId,
+      customerId,
+      status: "completed",
+      review: { $exists: false },
+    },
+    { $set: { review, updatedAt: now } },
+    { returnDocument: "after" }
+  );
+
+  if (!updated) {
+    const existing = await getBookingsCollection().findOne(
+      { _id: bookingId, customerId },
+      { projection: { _id: 1, status: 1, review: 1 } }
+    );
+
+    if (!existing) {
+      res.status(404).json({
+        success: false,
+        message: "Booking not found.",
+      });
+      return;
+    }
+
+    if (existing.status !== "completed") {
+      res.status(409).json({
+        success: false,
+        message: "Only completed bookings can be reviewed.",
+      });
+      return;
+    }
+
+    res.status(409).json({
+      success: false,
+      message: "This booking has already been reviewed.",
+    });
+    return;
+  }
+
+  res.status(201).json({
+    success: true,
+    message: "Review submitted successfully.",
+    data: {
+      rating: review.rating,
+      comment: review.comment,
+      createdAt: review.createdAt,
+    },
   });
 };

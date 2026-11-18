@@ -167,6 +167,7 @@ Optional (server refuses only the related endpoint, not boot):
 | `STRIPE_API_BASE`       | `http://127.0.0.1:…`       | test-only Stripe API override (never prod) |
 | `IMGBB_API_KEY`         | `abcd…`                    | ImgBB API key (server-only)               |
 | `IMGBB_UPLOAD_URL`      | `https://api.imgbb.com/1/upload` | override for tests (default)             |
+| `INVOICE_TAX_RATE`      | `0.05`                     | optional platform tax rate applied inclusive to invoices |
 
 The real `.env` must never be committed. `.env.example` has the same shape
 with placeholder values.
@@ -178,10 +179,10 @@ server, ever.
 
 | Collection   | Purpose                                                                                                    | Key indexes                                                                                                      |
 | ------------ | ---------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `user`       | Better Auth user accounts + server-managed fields: `role`, `phone`, `area`, `bio`, `technicianApplication` (subdocument), `isMainAdmin` (boolean) | `{ technicianApplication.status: 1, technicianApplication.submittedAt: -1 }` |
+| `user`       | Better Auth user accounts + server-managed fields: `role`, `phone`, `area`, `bio`, `technicianApplication` (subdocument), `isMainAdmin` (boolean), `location` (optional), `availability` (optional), `notifications` (embedded ≤50), `adminConfig` (Main Admin only: embedded `coupons` ≤200) | `{ technicianApplication.status: 1, technicianApplication.submittedAt: -1 }` |
 | `services`   | Technicians' repair service listings (pending/approved/rejected)                                           | `{ technicianId: 1 }`, `{ category: 1 }`, `{ createdAt: -1 }`, `{ approvalStatus: 1, availabilityStatus: 1, category: 1 }` |
-| `bookings`   | Customer booking lifecycle requests (`requested → accepted|rejected|cancelled, → in-progress → completed`) | `{ customerId: 1, serviceId: 1 }` partial unique (active statuses only), `{ technicianId: 1, status: 1 }`, `{ customerId: 1, status: 1 }`, `{ createdAt: -1 }` |
-| `payments`   | Stripe Checkout records (`pending → succeeded|expired|failed`) tied to a booking; webhook-controlled only | `{ bookingId: 1 }` partial unique `pending` **and** `{ bookingId: 1 }` partial unique `succeeded`, `{ stripeSessionId: 1 }` unique sparse, `{ customerId: 1, createdAt: -1 }`, `{ status: 1, createdAt: -1 }` |
+| `bookings`   | Customer booking lifecycle requests (`requested → accepted|rejected|cancelled, → in-progress → completed`) + embedded `schedule`/`timeline`/`conversation`/`review`/`invoice`/`appliedCoupon` | `{ customerId: 1, serviceId: 1 }` partial unique (active statuses only), `{ technicianId: 1, status: 1 }`, `{ customerId: 1, status: 1 }`, `{ createdAt: -1 }`, `{ technicianId: 1, "schedule.date": 1, "schedule.slotStart": 1 }` unique partial, `{ customerId: 1, "appliedCoupon.code": 1 }` partial, `{ review.createdAt: -1 }` partial, `{ serviceId: 1 }` partial |
+| `payments`   | Stripe Checkout records (`pending → succeeded|expired|failed`) tied to a booking; webhook-controlled only + embedded `appliedCoupon` and `refunds` (≤10) | `{ bookingId: 1 }` partial unique `pending` **and** `{ bookingId: 1 }` partial unique `succeeded`, `{ stripeSessionId: 1 }` unique sparse, `{ customerId: 1, createdAt: -1 }`, `{ status: 1, createdAt: -1 }` |
 
 ## Authentication and sessions
 
@@ -343,10 +344,15 @@ Customers pay for `completed` bookings that are `paymentStatus: "unpaid"`.
    collected by FixMate.
 3. Stripe calls `POST /api/payments/webhook`. The raw request body is
    verified against `STRIPE_WEBHOOK_SECRET` via `stripe.webhooks.constructEvent`.
-   The payload's `client_reference_id` and `metadata.bookingId` must match
-   a stored `pending` payment; `amount_total` and `currency` are
-   re-validated against the stored record. Only then are the booking and
-   payment flipped to `paid`/`succeeded` in the same atomic step.
+   The payload's `metadata.bookingId` (and `client_reference_id`, when
+   present) must match a stored `pending` payment; `amount_total` and
+   `currency` are re-validated against the stored record, and the booking
+   must still belong to the recorded customer. Only then is the payment
+   claimed atomically (`pending` → `succeeded`) and the booking marked
+   `paid`; the claim order (payment first) and the self-heal reconcile on
+   redelivery mean a crash mid-flight is safely repairable. A `completed`
+   session only settles when Stripe reports `payment_status: "paid"` —
+   asynchronous methods settle via `checkout.session.async_payment_succeeded`.
    `checkout.session.expired` and `checkout.session.async_payment_failed`
    mark the payment `expired`/`failed` — the booking is never marked paid
    by an unverified redirect from the frontend.
@@ -446,3 +452,104 @@ See [DEPLOYMENT.md](./DEPLOYMENT.md) for the environment variable inventory,
 CORS/trusted-origins, replica-set requirement, webhook URL, reverse proxy
 headers and error-reporting checklist. Real secrets are **never** committed;
 `.env.example` is a template.
+
+## Production hardening — embedded extensions (v2)
+
+The four-collection architecture (`user`, `services`, `bookings`, `payments`)
+is preserved. All new platform state is embedded, bounded, and documented
+here. **No fifth application-owned collection was created.**
+
+### New environment variables
+
+| Variable | Example | Notes |
+|---|---|---|
+| `INVOICE_TAX_RATE` | `0.05` | Optional. Platform tax rate applied **inclusive** to the invoice total (informational breakdown only — never changes the charged amount). Unset/0 disables. |
+
+### Socket.IO (`/socket.io`)
+
+- Transports: `polling` + `websocket`. `maxHttpBufferSize`: 16 KB.
+- **Authentication**: the client passes the short-lived Better Auth JWT (from
+  `GET /api/auth/token`) in the handshake as `auth.token`. The server
+  re-verifies it against the JWKS with issuer/audience = `BETTER_AUTH_URL`,
+  then re-reads `role` from the database. Sockets are never authenticated
+  from cookies or client-supplied user ids.
+- **Rooms**: `user:<hex>` (all of a user's notifications) and
+  `booking:<hex>` (booking chat delivery). Joining `booking:<hex>` requires
+  the same participant-or-admin authorization as the REST chat endpoints.
+- **Events (server → client)**: `notification` (`{ id, type, title, body, bookingId?, serviceId?, createdAt, readAt }`), `chat:message` (message DTO), `chat:read` (`{ bookingId, readBy, readAt }`).
+- **Client → server**: only room-management (`join:booking`, `leave:booking`). Message *sending* goes over REST (`POST /api/bookings/:id/chat`) and is rate-limited (30/min per user); sockets never accept payload writes.
+- Embedded notifications are capped at **50 per user** (`$slice`); chat messages at **200 per booking**; booking timelines at **100 events**. Older entries are trimmed atomically.
+
+### New endpoints (summary)
+
+| Method + Path | Auth | Notes |
+|---|---|---|
+| `GET /api/notifications` | any authenticated user | Paginated own notifications (`page`, `limit ≤ 50`, `unreadOnly`). Includes `unreadCount`. |
+| `GET /api/notifications/unread-count` | any authenticated user | `{ data: { unreadCount } }` |
+| `PATCH /api/notifications/:id/read` | owner only | Marks one as read. |
+| `POST /api/notifications/read-all` | owner only | Marks all as read. |
+| `GET /api/users/me/availability` | technician | Own availability (defaults: available, Mon–Sat 09:00–18:00). |
+| `PUT /api/users/me/availability` | technician | Strict Zod validation; 7-day weekly schedule, ≤60 unavailable dates, ≤10 service areas. |
+| `GET /api/technicians/:id/availability` | any authenticated user | Public working pattern + `bookedSlots` for `?date=YYYY-MM-DD`. |
+| `GET /api/services/:id/availability` | any authenticated user | Same, keyed by service id (does not leak the technician id). |
+| `GET /api/services/nearby` | public | `?area=` or `?lat=`+`?lng=` (both required without area) + optional `limit ≤ 24`. Approved+available only; distance-sorted when coordinates exist on both sides; area-regex otherwise. Never returns coordinates. |
+| `GET /api/bookings/:id/invoice` | owner, assigned technician, or admin | LAZY-CREATED invoice snapshot (eligible: `status = completed`). Print-friendly. |
+| `POST /api/bookings/:id/chat` | participants (+admin for read) | Create message (≤500 chars, rate-limited). |
+| `GET /api/bookings/:id/chat` | participants + admin | Cursor pagination (`before=<messageId>`, `limit ≤ 50`), returns `hasMore`, `unreadCount`. |
+| `POST /api/bookings/:id/chat/read` | participants | Marks the other party's messages as read. |
+| `POST /api/payments/:paymentId/refunds` | customer (owner, paid booking) | Request refund. Idempotency-safe; one pending request per payment. |
+| `GET /api/admin/refunds` | admin | Paginated refund moderation queue (`status=pending|succeeded|failed|rejected`). |
+| `POST /api/admin/refunds/:paymentId/:refundId/decide` | admin | `{ decision: "approve" \| "reject", note? }`. Approve issues a Stripe refund with the stored idempotency key. |
+| `GET /api/admin/analytics` | admin | Aggregations over existing collections; revenue **per currency** (never summed across currencies). `?from=YYYY-MM-DD&to=YYYY-MM-DD` (default: last 30 days UTC). |
+| `GET /api/admin/bookings/:id` | admin | Full booking detail incl. server-written timeline and invoice snapshot. |
+| `GET /api/admin/coupons` | admin | List (`isMainAdmin` flag indicates write eligibility). |
+| `POST /api/admin/coupons` | **Main Admin only** | Create coupon (atomic counter in `adminConfig.coupons` on the Main Admin user doc). |
+| `PATCH /api/admin/coupons/:code` | **Main Admin only** | Edit safe fields (`active`, `expiresAt`, `perCustomerLimit`, `globalLimit`). |
+| `DELETE /api/admin/coupons/:code` | **Main Admin only** | Soft-disable. |
+| `POST /api/coupons/validate` | customer | Preview discount for a completed, unpaid booking. Never used to charge. |
+
+### Stripe webhook events required for refunds
+
+The checkout flow is unchanged (`checkout.session.completed`,
+`checkout.session.async_payment_succeeded`, `checkout.session.expired`,
+`checkout.session.async_payment_failed`). Refund processing adds:
+
+| Event | Subscription needed? | Handling |
+|---|---|---|
+| `charge.refunded` | **Yes** — register on `POST /api/payments/webhook` | Marks embedded refund records as `succeeded` (matched by `stripeRefundId`), sets `bookings.paymentStatus = refunded` on full refunds and `invoice.paymentStatus = refunded` / `partially_refunded` otherwise. Idempotent on redelivery. |
+
+Register the webhook URL in the Stripe Dashboard with at least these events
+enabled; the signing secret must match `STRIPE_WEBHOOK_SECRET`.
+
+### Refund model & guarantees
+
+- Refunds are embedded (`MAX_REFUNDS_PER_PAYMENT = 10`) on the succeeded payment document.
+- Only the **customer who owns** the payment can request a refund; only **admins** can approve/reject. Main Admin hierarchy untouched.
+- The refundable remainder is recomputed from embedded records; partial refunds allowed; the Stripe refund call uses a per-refund **idempotency key** (`refund.idempotencyKey`) so retries never double-charge.
+- `succeeded` refunds are reflected in invoices automatically (`paymentStatus` becomes `refunded` / `partially_refunded`).
+
+### Coupon model & guarantees
+
+- Coupon definitions live in `adminConfig.coupons` embedded on the **single Main Admin** user document (bounded ≤ 200). Only the designated Main Admin can create/edit; reads are admin-wide.
+- Validation + atomic `usageCount` claim happen inside a **MongoDB transaction** at checkout creation. Per-customer limits count *succeeded* redemptions (partial index `bookings_customerId_1_couponCode_1`). Global limit enforced inside the transaction.
+- Stripe charge amount always equals `finalAmount − server-computed discount`; the webhook re-derives the expected amount from the same rules before settling.
+- The invoice shows the discount as a line item; amounts are immutable.
+
+### Embedded schema notes & 16 MB document limit
+
+| Document | Embedded state | Bounds |
+|---|---|---|
+| `user` | `availability`, `location`, `notifications[≤50]`, `adminConfig.coupons[≤200]` (Main Admin only), `technicianApplication` | Hard caps enforced via `$slice` and validation |
+| `bookings` | `schedule`, `timeline[≤100]`, `conversation.messages[≤200]`, `review`, `invoice`, `appliedCoupon` | Hard caps enforced via `$slice` and validation |
+| `payments` | `appliedCoupon`, `refunds[≤10]` | Hard caps enforced in validators |
+
+Estimated worst-case booking document size is ≈ 150 KB — far below 16 MB.
+
+### Known limitations
+
+- Multi-document transactions (coupons, Main Admin transfer) need a **replica set** (single-node is fine; standalone `mongod` is not). The booking schedule uniqueness relies on a partial unique index + hourly `:00`-aligned slots rather than transactions.
+- Appointment slots are **fixed 60-minute, `:00`-aligned** in the technician's IANA timezone. Ragged overlapping intervals cannot be guaranteed race-free with this model; the unique partial index `bookings_technician_schedule_active_unique` enforces exact-slot uniqueness atomically.
+- In-flight notifications are best-effort after the DB commit (logged on failure, never block or roll back the operation).
+- Refunds performed while Stripe is down or unconfigured: stay `failed` with `failureReason`; retry allowed via re-decision (same idempotency key).
+- Analytics `coupons.discountMinorByCurrency` assumes 2-decimal currencies (documented limitation; zero-decimal/three-decimal currencies mis-convert slightly).
+- No background workers are used; all event fan-out happens inline in the request path.

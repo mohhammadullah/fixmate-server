@@ -10,7 +10,9 @@
  * (completed/unpaid/finalAmount), ownership, client tampering, duplicate
  * concurrent checkout creation, webhook signature checks, successful
  * webhook processing, duplicate webhook delivery, amount/currency/metadata
- * mismatch, expired sessions, and payment-history ownership.
+ * mismatch, expired sessions, asynchronous payment flow (completed while
+ * unpaid, then async_payment_succeeded), cross-customer booking rejection,
+ * and payment-history ownership.
  *
  * Required env: MONGODB_URI, MONGODB_DB_NAME (from .env).
  * Optional env: STRIPE_CURRENCY (defaults to usd for the test).
@@ -243,6 +245,7 @@ const main = async () => {
     I: new ObjectId(), // webhook currency mismatch
     J: new ObjectId(), // webhook metadata mismatch
     K: new ObjectId(), // async payment failed flow
+    L: new ObjectId(), // async payment success flow
   };
   const FOREIGN_BOOKING_ID = new ObjectId();
 
@@ -258,6 +261,7 @@ const main = async () => {
     makeBooking(BOOKING.I, { finalAmount: 30 }),
     makeBooking(BOOKING.J, { finalAmount: 77 }),
     makeBooking(BOOKING.K, { finalAmount: 25 }),
+    makeBooking(BOOKING.L, { finalAmount: 55 }),
     makeBooking(FOREIGN_BOOKING_ID, { customerId: new ObjectId() }),
   ]);
 
@@ -577,6 +581,120 @@ const main = async () => {
     check(kAfter.status === "failed", `payment marked failed (got ${kAfter.status})`);
     const kBooking = await bookings.findOne({ _id: BOOKING.K });
     check(kBooking.paymentStatus === "unpaid", "booking stays unpaid after async payment failure");
+
+    // --- Webhook: async payment flow (completed while unpaid, then success) ----
+    console.log("\n[webhook async payment flow]");
+    const lCheckout = await createCheckout(restoredToken, BOOKING.L, checkoutPayload(BOOKING.L));
+    check(lCheckout.status === 201, `checkout for async-flow booking -> ${lCheckout.status}`);
+    const lPayment = await payments.findOne({ bookingId: BOOKING.L });
+    // Asynchronous payment methods fire `checkout.session.completed` BEFORE
+    // the money moves (payment_status "unpaid"). Nothing may settle yet.
+    const asyncCompleted = {
+      id: `evt_async_${lPayment._id.toHexString()}`,
+      object: "event",
+      type: "checkout.session.completed",
+      livemode: false,
+      created: Math.floor(Date.now() / 1000),
+      data: {
+        object: {
+          id: lPayment.stripeSessionId,
+          object: "checkout.session",
+          status: "complete",
+          payment_status: "unpaid",
+          amount_total: lPayment.amount,
+          currency: lPayment.currency,
+          metadata: { bookingId: BOOKING.L.toHexString(), customerId: userId.toHexString() },
+        },
+      },
+    };
+    const asyncResult = await sendWebhook(asyncCompleted);
+    check(asyncResult.status === 200, `async completed webhook -> ${asyncResult.status} (expected 200)`);
+    const lPending = await payments.findOne({ _id: lPayment._id });
+    check(lPending.status === "pending", `payment stays pending while money is in flight (got ${lPending.status})`);
+    const lBookingPending = await bookings.findOne({ _id: BOOKING.L });
+    check(lBookingPending.paymentStatus === "unpaid", "booking stays unpaid while money is in flight");
+    // The money settles asynchronously: verified only then.
+    const asyncSucceeded = {
+      id: `evt_asyncsucc_${lPayment._id.toHexString()}`,
+      object: "event",
+      type: "checkout.session.async_payment_succeeded",
+      livemode: false,
+      created: Math.floor(Date.now() / 1000),
+      data: {
+        object: {
+          id: lPayment.stripeSessionId,
+          object: "checkout.session",
+          status: "complete",
+          payment_status: "paid",
+          amount_total: lPayment.amount,
+          currency: lPayment.currency,
+          payment_intent: `pi_mock_async_${lPayment._id.toHexString()}`,
+          metadata: { bookingId: BOOKING.L.toHexString(), customerId: userId.toHexString() },
+        },
+      },
+    };
+    const succeededAsync = await sendWebhook(asyncSucceeded);
+    check(succeededAsync.status === 200, `async_payment_succeeded webhook -> ${succeededAsync.status} (expected 200)`);
+    const lAfter = await payments.findOne({ _id: lPayment._id });
+    check(lAfter.status === "succeeded", `payment marked succeeded after async settlement (got ${lAfter.status})`);
+    check(Boolean(lAfter.paidAt), "payment marked succeeded after async settlement carries paidAt");
+    const lBookingPaid = await bookings.findOne({ _id: BOOKING.L });
+    check(lBookingPaid.paymentStatus === "paid", "booking marked paid after async_payment_succeeded");
+    // Duplicate delivery of the async success event is a no-op.
+    const duplicateAsync = await sendWebhook(asyncSucceeded);
+    check(duplicateAsync.status === 200, `duplicate async_payment_succeeded -> ${duplicateAsync.status} (expected 200)`);
+    const lAfterDup = await payments.findOne({ _id: lPayment._id });
+    check(lAfterDup.status === "succeeded", "payment remains succeeded after duplicate async success");
+    const lBookingDup = await bookings.findOne({ _id: BOOKING.L });
+    check(lBookingDup.paymentStatus === "paid", "booking remains paid after duplicate async success");
+
+    // --- Webhook: cannot settle a booking owned by someone else -----------------
+    // A pending payment is seeded that names FOREIGN_BOOKING_ID (a booking
+    // owned by a third party, finalAmount 150 → 15000 minor units) but this
+    // customer. Even with a perfectly signed session and matching
+    // amount/currency/booking metadata, the webhook must refuse to settle
+    // it — the booking's owner does not match the recorded payer.
+    console.log("\n[webhook foreign booking rejected]");
+    const foreignSettleId = new ObjectId();
+    await payments.insertOne({
+      _id: foreignSettleId,
+      bookingId: FOREIGN_BOOKING_ID,
+      customerId: userId,
+      technicianId: new ObjectId(),
+      stripeSessionId: "cs_test_foreign_settle",
+      checkoutUrl: "https://checkout.stripe.test/pay/cs_test_foreign_settle",
+      amount: 15000,
+      currency: TEST_CURRENCY,
+      status: "pending",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const foreignSettleEvent = {
+      id: `evt_foreign_${foreignSettleId.toHexString()}`,
+      object: "event",
+      type: "checkout.session.completed",
+      livemode: false,
+      created: Math.floor(Date.now() / 1000),
+      data: {
+        object: {
+          id: "cs_test_foreign_settle",
+          object: "checkout.session",
+          status: "complete",
+          payment_status: "paid",
+          amount_total: 15000,
+          currency: TEST_CURRENCY,
+          payment_intent: "pi_foreign_settle",
+          metadata: { bookingId: FOREIGN_BOOKING_ID.toHexString(), customerId: userId.toHexString() },
+        },
+      },
+    };
+    const foreignSettleResult = await sendWebhook(foreignSettleEvent);
+    check(foreignSettleResult.status === 200, `webhook for foreign booking -> ${foreignSettleResult.status} (expected 200, ignored)`);
+    const foreignSettleAfter = await payments.findOne({ _id: foreignSettleId });
+    check(foreignSettleAfter.status === "failed", `payment refused on booking-ownership mismatch (got ${foreignSettleAfter.status})`);
+    const foreignBookingAfter = await bookings.findOne({ _id: FOREIGN_BOOKING_ID });
+    check(foreignBookingAfter.paymentStatus === "unpaid", "another customer's booking is never marked paid");
+    await payments.deleteOne({ _id: foreignSettleId });
 
     // --- Payment history ---------------------------------------------------------
     console.log("\n[payment history]");
