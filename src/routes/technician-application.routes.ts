@@ -11,8 +11,6 @@ import {
 
 const router = Router();
 
-// Static /my is registered before nothing dynamic here, but keep the order
-// explicit for consistency with the other route modules.
 router.post("/", verifyToken, verifyCustomer, submitApplication);
 router.get("/my", verifyToken, getMyApplication);
 router.get("/", verifyToken, verifyAdmin, listApplications);

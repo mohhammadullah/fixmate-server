@@ -2,7 +2,6 @@
 import { z } from "zod";
 import { SERVICE_CATEGORIES, SERVICE_APPROVAL_STATUSES } from "../models/service.model.js";
 
-// Shared field schemas. Strings are trimmed before length checks.
 const QUERY_STRING_MAX = 200;
 
 // Escapes every regex metacharacter so user input is always matched

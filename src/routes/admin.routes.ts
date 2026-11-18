@@ -14,7 +14,6 @@ import {
 
 const router = Router();
 
-// Every route is guarded by JWT verification followed by the admin role guard.
 router.get("/dashboard/stats", verifyToken, verifyAdmin, getDashboardStats);
 
 router.get("/users", verifyToken, verifyAdmin, listUsers);

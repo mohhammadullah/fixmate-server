@@ -10,7 +10,6 @@ import { verifyAdmin } from "../middleware/verifyAdmin.js";
 
 const router = Router();
 
-// Public API
 router.get("/public", (_req, res) => {
   res.status(200).json({
     success: true,
@@ -18,7 +17,6 @@ router.get("/public", (_req, res) => {
   });
 });
 
-// Protected API — any authenticated user
 router.get(
   "/protected",
   verifyToken,
@@ -31,7 +29,6 @@ router.get(
   }
 );
 
-// Customer-only API
 router.get(
   "/customer",
   verifyToken,
@@ -45,7 +42,6 @@ router.get(
   }
 );
 
-// Technician-only API
 router.get(
   "/technician",
   verifyToken,
@@ -59,7 +55,6 @@ router.get(
   }
 );
 
-// Admin-only API
 router.get(
   "/admin",
   verifyToken,

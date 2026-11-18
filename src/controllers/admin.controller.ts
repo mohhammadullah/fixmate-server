@@ -152,9 +152,8 @@ const toBookingDto = (booking: Booking) => ({
 });
 
 // GET /api/admin/dashboard/stats — aggregated platform counters.
-// Payments: no payments collection/model or verified payment records exist
-// in the current schema, so the amount is honestly reported as 0 with an
-// availability flag — never fabricated.
+// Payment stats are not wired to the payments collection yet; the amount
+// is reported as 0 with an availability flag rather than fabricated.
 export const getDashboardStats = async (
   _req: AuthenticatedRequest,
   res: Response
@@ -210,7 +209,7 @@ export const getDashboardStats = async (
       completedBookings,
       cancelledBookings,
       pendingTechnicianApplications,
-      // No verified payment records exist in the current schema.
+      // Payment totals are not wired to the payments collection yet.
       totalSuccessfulPaymentAmount: 0,
       paymentsAvailable: Boolean(paymentsCollection),
       paymentNote: paymentsCollection
