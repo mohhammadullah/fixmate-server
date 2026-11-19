@@ -56,7 +56,8 @@ export const uploadImage = async (
   let file: File | null = null;
   try {
     // Native Request/FormData parse of the raw multipart payload.
-    const parsed = await new Request("http://localhost/upload", {
+    // Use the global Fetch Request constructor (not the Express Request type).
+    const parsed = await new globalThis.Request("http://localhost/upload", {
       method: "POST",
       headers: { "content-type": contentType },
       // Copy the raw multipart bytes into a Blob for the native FormData parser.
