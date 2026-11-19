@@ -303,6 +303,8 @@ All endpoints are served from `http://<BACKEND>/api/`. `Auth` = JWT Bearer.
 | ------ | -------------------------------------- | -------------- |
 | GET    | `/api/users/me`                        | any authenticated |
 | PATCH  | `/api/users/me`                        | any authenticated |
+| POST   | `/api/users/me/image`                  | any authenticated |
+| DELETE | `/api/users/me/image`                  | any authenticated |
 | GET    | `/api/admin/dashboard/stats`           | Admin          |
 | GET    | `/api/admin/users`                     | Admin          |
 | GET    | `/api/admin/users/:id`                 | Admin          |
@@ -312,6 +314,15 @@ All endpoints are served from `http://<BACKEND>/api/`. `Auth` = JWT Bearer.
 | GET    | `/api/admin/services`                  | Admin          |
 | GET    | `/api/admin/payments`                  | Admin          |
 | POST   | `/api/uploads/image`                   | Technician     |
+
+`POST /api/users/me/image` accepts `multipart/form-data` with a single `image`
+file (JPEG/PNG/WebP, ≤ 5 MB, magic-byte verified) and streams it to ImgBB
+using the server-held `IMGBB_API_KEY` — the file never touches disk and the
+key never reaches the client. The resulting hosted URL is stored on the
+caller's Better Auth `user` document (`image` field); identity comes only
+from the verified JWT, so one account can never replace another's photo.
+`DELETE /api/users/me/image` clears the reference (idempotent). Both respond
+with the same safe profile DTO as `GET /api/users/me`, now including `image`.
 
 ## Customer booking workflow
 

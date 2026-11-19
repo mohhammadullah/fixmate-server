@@ -27,6 +27,9 @@ export interface UserWithApplication {
   phone?: string;
   area?: string;
   bio?: string;
+  /** Hosted avatar URL managed via /api/users/me/image (Better Auth's
+   *  default `image` field). null when no photo is set. */
+  image?: string | null;
   technicianApplication?: TechnicianApplication;
   [key: string]: unknown;
 }
