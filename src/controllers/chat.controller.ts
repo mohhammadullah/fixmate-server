@@ -228,29 +228,48 @@ export const markChatRead = async (
     return;
   }
 
-  const { access } = await resolveAccess(bookingId, req.user);
-  if (!access) {
+  const { access, booking } = await resolveAccess(bookingId, req.user);
+  if (!access || !booking) {
     res.status(404).json({ success: false, message: "Booking not found." });
     return;
   }
 
+  // Legacy bookings may have no `conversation`, no `messages`, or a `messages`
+  // field that is not an array. MongoDB rejects `$[...]` array updates when
+  // the targeted path does not exist, so only issue the update when there is
+  // actually something to mark. This also makes repeated read calls no-ops.
   const now = new Date();
-  // Mark only the OTHER party's messages as read.
-  const update: Document = {
-    $set: { "conversation.messages.$[m].readAt": now },
-  };
-  await getBookingsCollection().updateOne(
-    { _id: bookingId },
-    update,
-    {
-      arrayFilters: [
-        {
-          "m.senderId": { $ne: new ObjectId(req.user.id) },
-          "m.readAt": null,
-        },
-      ],
-    }
+  const messages = Array.isArray(booking.conversation?.messages)
+    ? booking.conversation.messages
+    : [];
+  const readerId = new ObjectId(req.user.id);
+  const readerHexId = readerId.toHexString();
+  const hasUnreadFromOther = messages.some(
+    (message) =>
+      message.senderId.toHexString() !== readerHexId && !message.readAt
   );
+
+  if (hasUnreadFromOther) {
+    // Defensive filter: even if the booking changed between load and update,
+    // never attempt an array update on a missing/non-array path.
+    await getBookingsCollection().updateOne(
+      {
+        _id: bookingId,
+        "conversation.messages": { $type: "array" },
+      },
+      {
+        $set: { "conversation.messages.$[m].readAt": now },
+      },
+      {
+        arrayFilters: [
+          {
+            "m.senderId": { $ne: readerId },
+            "m.readAt": null,
+          },
+        ],
+      }
+    );
+  }
 
   emitToBookingRoom(bookingId, "chat:read", {
     bookingId: bookingId.toHexString(),
