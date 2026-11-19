@@ -94,9 +94,10 @@ export const createApp = (auth: Auth) => {
     });
   });
 
-  // Demo/test endpoints are development-only. In production they are never
-  // mounted, so requests hit the standard 404 handler before anything runs.
-  if (!env.isProduction) {
+  // Demo/test endpoints exist in development and test ONLY. `isProduction`
+  // is true only for an explicit NODE_ENV=production (env.ts never defaults
+  // to production), so these routes can never be mounted in production.
+  if (!env.isProduction && (env.NODE_ENV === "development" || env.NODE_ENV === "test")) {
     app.use("/api/test", testRoutes);
   }
   app.use("/api/services", serviceRoutes);

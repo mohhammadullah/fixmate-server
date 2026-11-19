@@ -1,5 +1,5 @@
 
-import type { IndexDescription } from "mongodb";
+import type { Db, IndexDescription } from "mongodb";
 import { getDB } from "./db.js";
 import { SERVICES_COLLECTION } from "../models/service.model.js";
 import {
@@ -179,23 +179,93 @@ export const userIndexes: IndexDescription[] = [
   },
 ];
 
-// Creates the indexes once, at startup. createIndexes is idempotent, so
-// re-running against identical definitions is a no-op on the server side.
-export const ensureIndexes = async (): Promise<string[]> => {
-  const db = getDB();
+// Unique indexes that enforce product invariants. If any of these cannot be
+// created, the server must not accept traffic: booking/slot/payment races
+// would otherwise be possible.
+export const CRITICAL_INDEX_NAMES = [
+  "bookings_active_customer_service_unique",
+  "bookings_technician_schedule_active_unique",
+  "payments_one_pending_per_booking_unique",
+  "payments_one_succeeded_per_booking_unique",
+  "payments_stripeSessionId_unique_sparse",
+] as const;
 
-  const [serviceIndexNames, bookingIndexNames, paymentIndexNames, userIndexNames] =
-    await Promise.all([
-      db.collection(SERVICES_COLLECTION).createIndexes(servicesIndexes),
-      db.collection(BOOKINGS_COLLECTION).createIndexes(bookingIndexes),
-      db.collection(PAYMENTS_COLLECTION).createIndexes(paymentIndexes),
-      db.collection(USERS_COLLECTION).createIndexes(userIndexes),
-    ]);
+/** Actionable startup failure. Never deletes or rewrites existing records. */
+export class IndexStartupError extends Error {
+  readonly collection: string;
+  readonly indexName: string | null;
+  readonly remediation: string;
 
-  return [
-    ...serviceIndexNames,
-    ...bookingIndexNames,
-    ...paymentIndexNames,
-    ...userIndexNames,
-  ];
+  constructor(args: {
+    collection: string;
+    indexName: string | null;
+    mongoMessage: string;
+    remediation: string;
+  }) {
+    super(
+      `MongoDB index startup failed on collection "${args.collection}"` +
+        `${args.indexName ? ` (index "${args.indexName}")` : ""}: ` +
+        `${args.mongoMessage}\n${args.remediation}`
+    );
+    this.name = "IndexStartupError";
+    this.collection = args.collection;
+    this.indexName = args.indexName;
+    this.remediation = args.remediation;
+  }
+}
+
+/** Convert a createIndexes failure into a message operators can act on. */
+export const describeIndexFailure = (
+  collection: string,
+  error: unknown
+): IndexStartupError => {
+  const mongoMessage = error instanceof Error ? error.message : String(error);
+  const indexName = mongoMessage.match(/index:\s*([^\s,]+)/i)?.[1] ?? null;
+  const duplicate = /E11000|duplicate key/i.test(mongoMessage);
+  const remediation = duplicate
+    ? `Existing ${collection} documents violate the unique index` +
+      `${indexName ? ` "${indexName}"` : ""}. Inspect the collection in MongoDB, ` +
+      `identify the duplicate key reported above, and manually merge or remove ` +
+      `the conflicting documents. This server never deletes or modifies records ` +
+      `to make index creation succeed. Resolve the duplicates, then restart.`
+    : `Check MongoDB connectivity, write permissions and the index definition, ` +
+      `then restart. The server will not accept traffic until indexes exist.`;
+  return new IndexStartupError({ collection, indexName, mongoMessage, remediation });
+};
+
+/**
+ * Creates the indexes once, at startup. createIndexes is idempotent, so
+ * re-running against identical definitions is a no-op on the server side.
+ * Failures are fatal: callers must refuse to serve traffic.
+ */
+export const ensureIndexes = async (db: Db = getDB()): Promise<string[]> => {
+  const groups = [
+    [SERVICES_COLLECTION, servicesIndexes],
+    [BOOKINGS_COLLECTION, bookingIndexes],
+    [PAYMENTS_COLLECTION, paymentIndexes],
+    [USERS_COLLECTION, userIndexes],
+  ] as const;
+
+  const created: string[] = [];
+  for (const [collection, definitions] of groups) {
+    try {
+      created.push(...(await db.collection(collection).createIndexes([...definitions])));
+    } catch (error) {
+      throw describeIndexFailure(collection, error);
+    }
+  }
+
+  const existing = new Set(created);
+  const missing = CRITICAL_INDEX_NAMES.filter((name) => !existing.has(name));
+  if (missing.length > 0) {
+    throw new IndexStartupError({
+      collection: "multiple",
+      indexName: missing[0],
+      mongoMessage: `required unique indexes are missing: ${missing.join(", ")}`,
+      remediation:
+        "Check MongoDB index creation permissions and retry. The server will not accept traffic without these indexes.",
+    });
+  }
+
+  return created;
 };

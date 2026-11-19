@@ -17,6 +17,7 @@ or in a gitignored `.env`.
 | Start (prod)    | `npm start` (`node dist/server.js`)                  |
 | Health check    | `GET /api/health` → `200 OK …`                       |
 | Test (pre-flight) | `npm run build && npm test` (see caveats below)    |
+| Config guards   | `npm run build && node scripts/config-guard-test.mjs` (no DB writes) |
 
 The server **requires `npm run build` before the isolated test suites will
 run** — suites spawn `../dist/server.js` / import `../dist`.
@@ -30,7 +31,7 @@ These are **mandatory** — the server refuses to boot without them
 
 | Variable              | Scope                    | Example value                                             | Required by     |
 | --------------------- | ------------------------ | --------------------------------------------------------- | --------------- |
-| `NODE_ENV`            | runtime                  | `production`                                              | boot            |
+| `NODE_ENV`            | runtime                  | `production` (must be explicit — unset stays `development`) | boot / prod-only behavior |
 | `PORT`                | runtime                  | `5000` (or the platform's injected `PORT`)                | boot            |
 | `CLIENT_URL`          | runtime → CORS           | `https://fixmate.example.com`                              | CORS + Better Auth trusted origin |
 | `MONGODB_URI`         | infra                    | `mongodb+srv://user:…@cluster…/`                          | Mongo connectivity |
@@ -40,6 +41,13 @@ These are **mandatory** — the server refuses to boot without them
 | `IMGBB_API_KEY`       | **secret** (optional)    | from <https://api.imgbb.com/>                              | ImgBB proxy endpoints |
 | `STRIPE_SECRET_KEY`   | **secret** (optional)    | from <https://dashboard.com/apikeys>                       | Stripe Checkout |
 | `STRIPE_WEBHOOK_SECRET` | **secret** (optional)  | from `stripe listen` (dev) or Dashboard → Webhooks (prod) | Stripe webhook signature |
+
+`STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET` must be configured **as a
+pair** or both omitted. A partial configuration fails startup so an unpayable
+Checkout Session can never be created. `CLIENT_URL` and `BETTER_AUTH_URL` must
+be public HTTPS URLs in production (loopback HTTP is allowed only for isolated
+production-mode tests). `STRIPE_API_BASE` and `IMGBB_UPLOAD_URL` are test-only
+overrides and are rejected when `NODE_ENV=production`.
 
 Optional configuration:
 
@@ -64,7 +72,11 @@ The pattern is always **server-only** — no secret is ever exposed through
   `?retryWrites=true&w=majority` if not already present and **use the
   replica-set style SRV string** — transactions need it.
 - The server creates its indexes once at startup via `ensureIndexes()` —
-  nothing manual is required. The `bookings`
+  nothing manual is required. Index creation is **fatal**: the server refuses
+  to accept traffic if any required index cannot be created. If duplicate
+  legacy documents block a unique index, the startup error names the exact
+  index and collection and asks for manual remediation; no records are
+  deleted or modified automatically. The `bookings`
   `bookings_active_customer_service_unique` partial index is the reason the
   constraint on duplicate active bookings cannot be bypassed by
   application-level races. The schedule partial unique index

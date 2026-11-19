@@ -9,7 +9,9 @@ import { env } from "./env.js";
 //
 // `STRIPE_API_BASE` may point the client at a mock of the Stripe API for
 // local tests. It is never set in production.
-export const isStripeConfigured = Boolean(env.STRIPE_SECRET_KEY);
+// env validation guarantees the key/secret pair is either complete or absent.
+// Using the shared flag keeps checkout and webhook availability consistent.
+export const isStripeConfigured = env.paymentsConfigured;
 
 export const stripeCurrency = env.STRIPE_CURRENCY;
 

@@ -12,17 +12,20 @@ const startServer = async (): Promise<void> => {
   // always sees a live Db instance.
   await connectDB();
 
-  // Create MongoDB indexes once at startup (never per request). Kept
-  // non-fatal so index provisioning issues cannot block Better Auth
-  // initialization or server startup; failures are logged loudly instead.
+  // Create MongoDB indexes once at startup, BEFORE creating Better Auth and
+  // before the HTTP/Socket.IO listener accepts traffic. Failure is fatal:
+  // duplicate-booking, slot and payment invariants depend on these indexes.
+  // No records are deleted or rewritten to make index creation succeed.
   try {
     const indexNames = await ensureIndexes();
     console.log(`MongoDB indexes ensured: ${indexNames.join(", ")}`);
   } catch (error) {
     console.error(
-      "Failed to create MongoDB indexes. Server will start anyway:",
-      error
+      "MongoDB index startup check failed. Refusing to start the server."
     );
+    console.error(error instanceof Error ? error.message : String(error));
+    await closeDB().catch(() => undefined);
+    process.exit(1);
   }
 
   const auth = createAuth();
