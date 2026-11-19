@@ -334,7 +334,13 @@ export const upsertCouponSchema = z
     active: z.boolean({ error: "active must be a boolean" }).default(true),
   })
   .superRefine((value, ctx) => {
-    if (value.startsAt.getTime() >= value.expiresAt.getTime()) {
+    if (
+      value.startsAt instanceof Date &&
+      value.expiresAt instanceof Date &&
+      !Number.isNaN(value.startsAt.getTime()) &&
+      !Number.isNaN(value.expiresAt.getTime()) &&
+      value.startsAt.getTime() >= value.expiresAt.getTime()
+    ) {
       ctx.addIssue({
         code: "custom",
         message: "startsAt must be before expiresAt",
