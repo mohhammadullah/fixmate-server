@@ -234,6 +234,17 @@ export const markChatRead = async (
     return;
   }
 
+  // Read receipts belong to the booking participants. Admins may moderate and
+  // view a conversation (see resolveAccess / listChatMessages), but must never
+  // mark either participant's messages as read through this endpoint.
+  if (access === "admin") {
+    res.status(403).json({
+      success: false,
+      message: "Only the customer or technician of this booking can mark messages as read.",
+    });
+    return;
+  }
+
   // Legacy bookings may have no `conversation`, no `messages`, or a `messages`
   // field that is not an array. MongoDB rejects `$[...]` array updates when
   // the targeted path does not exist, so only issue the update when there is

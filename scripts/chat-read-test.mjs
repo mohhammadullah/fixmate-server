@@ -21,6 +21,7 @@
 import "dotenv/config";
 import assert from "node:assert/strict";
 import { MongoClient, ObjectId } from "mongodb";
+import { io } from "socket.io-client";
 
 const BASE_URL = process.env.BASE_URL ?? "http://localhost:5000";
 const TEST_ORIGIN = process.env.TEST_ORIGIN ?? "http://localhost:3000";
@@ -75,6 +76,20 @@ const sendEndpoint = (bookingId, token, text) =>
     method: "POST",
     headers: jsonHeaders(token),
     body: JSON.stringify({ text }),
+  });
+
+const waitForChatReadEvent = (socket, timeoutMs = 1500) =>
+  new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      socket.off("chat:read", handler);
+      resolve(null);
+    }, timeoutMs);
+    const handler = (payload) => {
+      clearTimeout(timer);
+      socket.off("chat:read", handler);
+      resolve(payload);
+    };
+    socket.on("chat:read", handler);
   });
 
 const getJwt = async (sessionCookie) => {
@@ -314,7 +329,7 @@ const main = async () => {
       "own-only message left untouched"
     );
 
-    // 6. Authorization.
+    // 6. Authorization + admin read-only moderation.
     console.log("\n[authorization]");
     const foreignRead = await readEndpoint(mixed, outsider.token);
     check(foreignRead.status === 404, `outsider cannot mark conversation read -> ${foreignRead.status}`);
@@ -322,6 +337,79 @@ const main = async () => {
       method: "POST",
     });
     check(unauthenticated.status === 401, `read requires authentication -> ${unauthenticated.status}`);
+
+    const adminTarget = await seedBooking({
+      conversation: {
+        messages: [
+          message(customer.user._id, "customer", "customer unread for admin test", null),
+          message(technician.user._id, "technician", "technician unread for admin test", null),
+        ],
+      },
+    });
+    await users.updateOne({ _id: outsider.user._id }, { $set: { role: "admin" } });
+    const adminView = await api(`/api/bookings/${adminTarget.toHexString()}/chat`, {
+      headers: { authorization: `Bearer ${outsider.token}` },
+    });
+    check(adminView.status === 200, `admin retains read-only conversation access -> ${adminView.status}`);
+    const adminSend = await sendEndpoint(adminTarget, outsider.token, "Admins may not send chat messages.");
+    check(adminSend.status === 403, `admin still cannot send messages -> ${adminSend.status}`);
+    const adminRead = await readEndpoint(adminTarget, outsider.token);
+    check(adminRead.status === 403, `admin cannot mark participant messages read -> ${adminRead.status}`);
+    deepCheck(
+      (await bookings.findOne({ _id: adminTarget })).conversation.messages.map((m) => m.readAt ?? null),
+      [null, null],
+      "admin read leaves every participant readAt untouched"
+    );
+    await users.updateOne({ _id: outsider.user._id }, { $set: { role: "customer" } });
+
+    // 6b. Participant read emits exactly the expected public receipt.
+    console.log("\n[socket read events]");
+    let socket;
+    try {
+      const socketBooking = await seedBooking({
+        conversation: {
+          messages: [message(technician.user._id, "technician", "live read receipt test", null)],
+        },
+      });
+      socket = io(BASE_URL, {
+        transports: ["websocket"],
+        reconnection: false,
+        auth: { token: customer.token },
+      });
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("socket connect timeout")), 4000);
+        socket.once("connect", () => {
+          clearTimeout(timer);
+          resolve();
+        });
+        socket.once("connect_error", (error) => {
+          clearTimeout(timer);
+          reject(error);
+        });
+      });
+      const joinAck = await new Promise((resolve) =>
+        socket.emit("join:booking", { bookingId: socketBooking.toHexString() }, resolve)
+      );
+      check(joinAck?.success === true, `participant joined booking room -> ${JSON.stringify(joinAck)}`);
+
+      const eventPromise = waitForChatReadEvent(socket);
+      const participantRead = await readEndpoint(socketBooking, customer.token);
+      check(participantRead.status === 200, `participant read succeeds -> ${participantRead.status}`);
+      const receipt = await eventPromise;
+      check(
+        receipt !== null &&
+          receipt.bookingId === socketBooking.toHexString() &&
+          receipt.readBy === customer.user._id.toHexString() &&
+          typeof receipt.readAt === "string" &&
+          !("email" in receipt) &&
+          !("token" in receipt),
+        `chat:read payload contains only expected fields -> ${JSON.stringify(receipt)}`
+      );
+    } catch (error) {
+      fail(`socket read-event check threw: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      socket?.disconnect();
+    }
 
     // 7. Send path on legacy bookings, then read the new message.
     console.log("\n[send + read on legacy bookings]");
