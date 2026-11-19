@@ -23,7 +23,9 @@ import {
   getPaymentsCollection,
   PAYMENTS_COLLECTION,
   type Payment,
+  type PaymentRefund,
   type PaymentStatus,
+  type RefundStatus,
 } from "../models/payment.model.js";
 import { toMinorUnits, fromMinorUnits } from "../utils/currency.js";
 import { ensureInvoiceForBooking, setInvoicePaymentStatus } from "../utils/invoice.js";
@@ -59,6 +61,34 @@ const PAYMENT_SORT: Sort = { createdAt: -1, _id: -1 };
 // technicianId, bookingId policy aside) and the Stripe internals
 // (checkoutUrl after completion, session ids, payment intents) are
 // excluded. `amount` is returned in major currency units.
+// Customer-safe refund view. Stripe internals (idempotency key, Stripe
+// refund id) and the deciding admin id are deliberately excluded.
+interface CustomerRefundDTO {
+  id: string;
+  amountMinor: number;
+  amount: number;
+  currency: string;
+  reason: string;
+  status: RefundStatus;
+  requestedAt: Date;
+  decidedAt?: Date;
+  decisionNote?: string;
+  failureReason?: string;
+}
+
+const toCustomerRefundDTO = (refund: PaymentRefund): CustomerRefundDTO => ({
+  id: refund.id,
+  amountMinor: refund.amountMinor,
+  amount: fromMinorUnits(refund.amountMinor, refund.currency),
+  currency: refund.currency,
+  reason: refund.reason,
+  status: refund.status,
+  requestedAt: refund.requestedAt,
+  ...(refund.decidedAt ? { decidedAt: refund.decidedAt } : {}),
+  ...(refund.decisionNote ? { decisionNote: refund.decisionNote } : {}),
+  ...(refund.failureReason ? { failureReason: refund.failureReason } : {}),
+});
+
 interface PaymentDTO {
   id: string;
   bookingId: string;
@@ -68,6 +98,8 @@ interface PaymentDTO {
   createdAt: Date;
   updatedAt: Date;
   paidAt?: Date;
+  /** Present only when refund records exist; the customer's own requests. */
+  refunds?: CustomerRefundDTO[];
 }
 
 const toPaymentDTO = (payment: Payment): PaymentDTO => {
@@ -83,6 +115,9 @@ const toPaymentDTO = (payment: Payment): PaymentDTO => {
 
   if (payment.paidAt) {
     dto.paidAt = payment.paidAt;
+  }
+  if (payment.refunds?.length) {
+    dto.refunds = payment.refunds.map(toCustomerRefundDTO);
   }
 
   return dto;

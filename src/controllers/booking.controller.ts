@@ -152,6 +152,16 @@ const toPublicInvoice = (invoice: Booking["invoice"]) =>
       }
     : undefined;
 
+const toPublicSchedule = (
+  schedule: NonNullable<Booking["schedule"]>
+): NonNullable<BookingDetailsDTO["schedule"]> => ({
+  date: schedule.date,
+  slotStart: schedule.slotStart,
+  slotEnd: schedule.slotEnd,
+  durationMinutes: schedule.durationMinutes,
+  timezone: schedule.timezone,
+});
+
 const toBookingDetailsDTO = (
   booking: Booking,
   viewer?: { id: string; role: string }
@@ -189,13 +199,7 @@ const toBookingDetailsDTO = (
   }
 
   if (booking.schedule) {
-    dto.schedule = {
-      date: booking.schedule.date,
-      slotStart: booking.schedule.slotStart,
-      slotEnd: booking.schedule.slotEnd,
-      durationMinutes: booking.schedule.durationMinutes,
-      timezone: booking.schedule.timezone,
-    };
+    dto.schedule = toPublicSchedule(booking.schedule);
   }
 
   if (Array.isArray(booking.timeline) && booking.timeline.length > 0) {
@@ -212,6 +216,58 @@ const toBookingDetailsDTO = (
       (message) =>
         message.senderId.toHexString() !== viewer.id && !message.readAt
     ).length;
+  }
+
+  return dto;
+};
+
+/**
+ * Sanitized booking summary for create/list/transition responses. These
+ * endpoints previously returned raw MongoDB documents including customer and
+ * technician emails, security deposits and internal ObjectId references.
+ * `_id` stays as the public hex string consumers already use for navigation;
+ * no other internal field is exposed.
+ */
+interface BookingSummaryDTO {
+  _id: string;
+  customerName: string;
+  technicianName: string;
+  serviceTitle: string;
+  serviceCategory: Booking["serviceCategory"];
+  serviceLocation: string;
+  serviceImage: string;
+  hourlyRate: number;
+  problemDescription: string;
+  status: Booking["status"];
+  paymentStatus: Booking["paymentStatus"];
+  finalAmount?: number;
+  schedule?: NonNullable<BookingDetailsDTO["schedule"]>;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const toBookingSummaryDTO = (booking: Booking): BookingSummaryDTO => {
+  const dto: BookingSummaryDTO = {
+    _id: booking._id.toHexString(),
+    customerName: booking.customerName,
+    technicianName: booking.technicianName,
+    serviceTitle: booking.serviceTitle,
+    serviceCategory: booking.serviceCategory,
+    serviceLocation: booking.serviceLocation,
+    serviceImage: booking.serviceImage,
+    hourlyRate: booking.hourlyRate,
+    problemDescription: booking.problemDescription,
+    status: booking.status,
+    paymentStatus: booking.paymentStatus,
+    createdAt: booking.createdAt,
+    updatedAt: booking.updatedAt,
+  };
+
+  if (booking.finalAmount !== undefined) {
+    dto.finalAmount = booking.finalAmount;
+  }
+  if (booking.schedule) {
+    dto.schedule = toPublicSchedule(booking.schedule);
   }
 
   return dto;
@@ -468,7 +524,7 @@ export const createBooking = async (
   res.status(201).json({
     success: true,
     message: "Booking created successfully.",
-    data: booking,
+    data: toBookingSummaryDTO(booking),
   });
 };
 
@@ -547,7 +603,7 @@ export const listTechnicianBookings = async (
 
   res.status(200).json({
     success: true,
-    data: items,
+    data: items.map(toBookingSummaryDTO),
     pagination: {
       currentPage: page,
       limit,
@@ -663,7 +719,7 @@ const transitionRequestedBooking = async (
   res.status(200).json({
     success: true,
     message: successMessage,
-    data: updated,
+    data: toBookingSummaryDTO(updated),
   });
 };
 
@@ -797,7 +853,7 @@ export const updateBookingStatus = async (
   res.status(200).json({
     success: true,
     message: transition.message,
-    data: updated,
+    data: toBookingSummaryDTO(updated),
   });
 };
 
@@ -877,7 +933,7 @@ export const listMyBookings = async (
 
   res.status(200).json({
     success: true,
-    data: items,
+    data: items.map(toBookingSummaryDTO),
     pagination: {
       currentPage: page,
       limit,
@@ -965,7 +1021,7 @@ export const cancelBooking = async (
   res.status(200).json({
     success: true,
     message: "Booking cancelled successfully.",
-    data: updated,
+    data: toBookingSummaryDTO(updated),
   });
 };
 
