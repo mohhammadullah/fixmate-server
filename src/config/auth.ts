@@ -59,17 +59,32 @@ export const createAuth = () => {
     },
 
     advanced: {
-      ipAddress: {
-        // Better Auth reads X-Forwarded-For directly (Express's `trust proxy`
-        // setting does not apply to it). Only honor a multi-hop proxy chain
-        // when the operator has declared the proxies via TRUSTED_PROXIES;
-        // otherwise a spoofed or unresolvable header falls back to one
-        // shared bucket and locks out every user at once.
-        ...(env.TRUSTED_PROXIES.length > 0
-          ? { trustedProxies: [...env.TRUSTED_PROXIES] }
-          : {}),
-      },
+    ipAddress: {
+      // Better Auth reads X-Forwarded-For directly (Express's `trust proxy`
+      // setting does not apply to it). Only honor a multi-hop proxy chain
+      // when the operator has declared the proxies via TRUSTED_PROXIES;
+      // otherwise a spoofed or unresolvable header falls back to one
+      // shared bucket and locks out every user at once.
+      ...(env.TRUSTED_PROXIES.length > 0
+        ? { trustedProxies: [...env.TRUSTED_PROXIES] }
+        : {}),
     },
+    // The deployed frontend (Vercel) and backend (Render) are different sites,
+    // so session cookies must be sent on cross-site requests. SameSite=None is
+    // required for that; browsers also require Secure with None. Better Auth's
+    // default is SameSite=Lax, which prevents the browser from attaching the
+    // cookie to cross-origin API calls even with CORS credentials enabled.
+    // Production is HTTPS-only (enforced in env validation), so Secure cookies
+    // are safe here. Local development keeps the Lax default.
+    ...(env.isProduction
+      ? {
+          defaultCookieAttributes: {
+            sameSite: "none",
+            secure: true,
+          },
+        }
+      : {}),
+  },
 
     emailAndPassword: {
       enabled: true,
