@@ -151,9 +151,72 @@ const toBookingDto = (booking: Booking) => ({
   updatedAt: booking.updatedAt instanceof Date ? booking.updatedAt.toISOString() : String(booking.updatedAt),
 });
 
+interface SettledPaymentRevenue {
+  currency: string;
+  succeededPayments: number;
+  grossMinor: number;
+  refundedMinor: number;
+  netMinor: number;
+}
+
+/**
+ * Server-side revenue aggregation. Only settled ("succeeded") payments count.
+ * `payment.amount` is always minor units; refunds are embedded records and
+ * only those that actually completed (status "succeeded") reduce net revenue.
+ * Pending / rejected / failed refund requests are never subtracted.
+ *
+ * The aggregation runs entirely in MongoDB — no payment documents are loaded
+ * into Node memory, and no customer/Stripe fields are projected out.
+ */
+const aggregateSettledPaymentRevenue = async (): Promise<SettledPaymentRevenue[]> => {
+  const rows = await getPaymentsCollection()
+    .aggregate<SettledPaymentRevenue>([
+      { $match: { status: "succeeded" } },
+      {
+        $addFields: {
+          completedRefundMinor: {
+            $sum: {
+              $map: {
+                input: {
+                  $filter: {
+                    input: { $ifNull: ["$refunds", []] },
+                    as: "refund",
+                    cond: { $eq: ["$$refund.status", "succeeded"] },
+                  },
+                },
+                as: "refund",
+                in: "$$refund.amountMinor",
+              },
+            },
+          },
+        },
+      },
+      {
+        $group: {
+          _id: "$currency",
+          succeededPayments: { $sum: 1 },
+          grossMinor: { $sum: "$amount" },
+          refundedMinor: { $sum: "$completedRefundMinor" },
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          currency: "$_id",
+          succeededPayments: 1,
+          grossMinor: 1,
+          refundedMinor: 1,
+          netMinor: { $subtract: ["$grossMinor", "$refundedMinor"] },
+        },
+      },
+      { $sort: { currency: 1 } },
+    ])
+    .toArray();
+
+  return rows;
+};
+
 // GET /api/admin/dashboard/stats — aggregated platform counters.
-// Payment stats are not wired to the payments collection yet; the amount
-// is reported as 0 with an availability flag rather than fabricated.
 export const getDashboardStats = async (
   _req: AuthenticatedRequest,
   res: Response
@@ -175,6 +238,7 @@ export const getDashboardStats = async (
     completedBookings,
     cancelledBookings,
     pendingTechnicianApplications,
+    settledPaymentRevenue,
   ] = await Promise.all([
     users.countDocuments({}),
     users.countDocuments({ role: "customer" }),
@@ -188,11 +252,8 @@ export const getDashboardStats = async (
     bookings.countDocuments({ status: "completed" }),
     bookings.countDocuments({ status: "cancelled" }),
     users.countDocuments({ "technicianApplication.status": "pending" }),
+    aggregateSettledPaymentRevenue(),
   ]);
-
-  const paymentsCollection = await getDB()
-    .listCollections({ name: "payments" }, { nameOnly: true })
-    .next();
 
   res.status(200).json({
     success: true,
@@ -209,12 +270,15 @@ export const getDashboardStats = async (
       completedBookings,
       cancelledBookings,
       pendingTechnicianApplications,
-      // Payment totals are not wired to the payments collection yet.
-      totalSuccessfulPaymentAmount: 0,
-      paymentsAvailable: Boolean(paymentsCollection),
-      paymentNote: paymentsCollection
-        ? "Payment records exist but no verified successful-payment schema is defined yet."
-        : "Payments are not implemented yet; no verified payment records exist.",
+      // Per-currency settled revenue. Amounts stay in minor units and are
+      // never mixed across currencies. An empty array means no settled
+      // payments yet — not an accounting zero in an arbitrary currency.
+      settledPaymentRevenue,
+      paymentsAvailable: settledPaymentRevenue.length > 0,
+      paymentNote:
+        settledPaymentRevenue.length > 0
+          ? "Net revenue from settled payments, less completed Stripe refunds."
+          : "No settled payments yet. Pending, failed and expired checkouts are not counted.",
     },
   });
 };

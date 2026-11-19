@@ -159,8 +159,12 @@ const main = async () => {
     check(s.inProgressBookings === base.inProgressBookings + 1, "inProgressBookings delta +1");
     check(s.cancelledBookings === base.cancelledBookings + 1, "cancelledBookings delta +1");
     check(s.pendingTechnicianApplications === base.pendingTechnicianApplications, "pending applications unchanged");
-    check(s.totalSuccessfulPaymentAmount === 0, "payment amount honest zero");
+    check(Array.isArray(s.settledPaymentRevenue), "per-currency settledRevenue array present");
     check(typeof s.paymentsAvailable === "boolean", "paymentsAvailable flag present");
+    check(
+      !JSON.stringify(s).includes("stripeSessionId") && !JSON.stringify(s).includes("customerEmail"),
+      "stats payload has no payment/customer internals"
+    );
 
     // --- User listing ---
     console.log("\n[user listing]");
