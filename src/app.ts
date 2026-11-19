@@ -20,13 +20,14 @@ import availabilityRoutes from "./routes/availability.routes.js";
 import couponRoutes from "./routes/coupon.routes.js";
 import { errorHandler, notFoundHandler } from "./middleware/errorHandler.js";
 import { env } from "./config/env.js";
+import { getDB } from "./config/db.js";
 import type { Auth } from "./config/auth.js";
 
 export const createApp = (auth: Auth) => {
   const app = express();
 
   app.disable("x-powered-by");
-  app.set("trust proxy", 1);
+  app.set("trust proxy", env.trustProxy);
 
   app.use(helmet());
 
@@ -37,6 +38,35 @@ export const createApp = (auth: Auth) => {
     })
   );
 
+  // Lightweight liveness checks for platform probes. These must not depend on
+  // downstream services or the general API rate limiter.
+  app.get("/api/health", (_req, res) => {
+    res.status(200).json({
+      success: true,
+      status: "ok",
+      timestamp: new Date().toISOString(),
+    });
+  });
+
+  // Readiness checks required dependencies without exposing infrastructure
+  // details or internal error messages.
+  app.get("/api/ready", async (_req, res) => {
+    try {
+      await getDB().command({ ping: 1 });
+      res.status(200).json({
+        success: true,
+        status: "ready",
+        timestamp: new Date().toISOString(),
+      });
+    } catch {
+      res.status(503).json({
+        success: false,
+        status: "not_ready",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  });
+
   // NOTE: Better Auth owns rate limiting for /api/auth (see
   // src/config/auth.ts): explicit, path-aware rules with environment-aware
   // budgets. A second Express limiter here would double-count every auth
@@ -46,11 +76,13 @@ export const createApp = (auth: Auth) => {
   // Broad ceiling for non-auth API traffic: normal browser usage never
   // approaches it, abuse does. Development/test gets a generous budget
   // because all local traffic shares 127.0.0.1; production stays tight.
+  // Stripe webhook delivery/retries are signature-verified and exempted here.
   const apiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     limit: env.isProduction ? 600 : 6000,
     standardHeaders: "draft-8",
     legacyHeaders: false,
+    skip: (req) => req.path === "/payments/webhook",
     message: {
       success: false,
       message: "Too many requests, please try again later.",
@@ -83,14 +115,6 @@ export const createApp = (auth: Auth) => {
     res.json({
       success: true,
       message: "FixMate API is running!",
-    });
-  });
-
-  app.get("/api/health", (_req, res) => {
-    res.json({
-      success: true,
-      message: "FixMate server is healthy!",
-      timestamp: new Date().toISOString(),
     });
   });
 

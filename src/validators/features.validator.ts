@@ -200,73 +200,170 @@ export const couponIdParamSchema = z
 
 // ------------------------------- Coupons ---------------------------------
 
+const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+const ISO_DATE_PREFIX_RE = /^(\d{4})-(\d{2})-(\d{2})(?:[T\s]|$)/;
+
+const isStrictCalendarDate = (value: string): boolean => {
+  const dateOnly = DATE_ONLY_RE.exec(value);
+  if (dateOnly) {
+    return parseLocalDate(`${dateOnly[1]}-${dateOnly[2]}-${dateOnly[3]}`) !== null;
+  }
+  const isoPrefix = ISO_DATE_PREFIX_RE.exec(value);
+  if (isoPrefix) {
+    return parseLocalDate(`${isoPrefix[1]}-${isoPrefix[2]}-${isoPrefix[3]}`) !== null;
+  }
+  return true;
+};
+
+const couponDateSchema = (label: string) =>
+  z
+    .union([z.date(), z.string()], {
+      error: `${label} is required and must be a date`,
+    })
+    .superRefine((value, ctx) => {
+      if (value instanceof Date) {
+        if (Number.isNaN(value.getTime())) {
+          ctx.addIssue({ code: "custom", message: `${label} must be a valid date` });
+        }
+        return;
+      }
+      if (typeof value !== "string" || value.trim().length === 0) {
+        ctx.addIssue({ code: "custom", message: `${label} is required and must be a date` });
+        return;
+      }
+      const trimmed = value.trim();
+      if (!isStrictCalendarDate(trimmed)) {
+        ctx.addIssue({ code: "custom", message: `${label} must be a valid calendar date` });
+        return;
+      }
+      if (Number.isNaN(new Date(trimmed).getTime())) {
+        ctx.addIssue({ code: "custom", message: `${label} must be a valid date` });
+      }
+    })
+    .transform((value) => (value instanceof Date ? value : new Date(value.trim())));
+
+const couponCodeFieldSchema = z
+  .string({ error: "code is required and must be a string" })
+  .trim()
+  .min(3, "code must be at least 3 characters")
+  .max(32, "code must be at most 32 characters")
+  .transform((v) => v.toUpperCase())
+  .refine((v) => /^[A-Z0-9_\-]+$/.test(v), {
+    message: "code may only contain A-Z, 0-9, _ and -",
+  });
+
+const couponGlobalLimitSchema = z
+  .number({ error: "globalLimit must be a number" })
+  .int("globalLimit must be an integer")
+  .positive("globalLimit must be at least 1")
+  .max(1_000_000, "globalLimit is too large");
+
+const couponPerCustomerLimitSchema = z
+  .number({ error: "perCustomerLimit must be a number" })
+  .int("perCustomerLimit must be an integer")
+  .positive("perCustomerLimit must be at least 1")
+  .max(1000, "perCustomerLimit is too large");
+
+const couponMaxDiscountSchema = z
+  .number({ error: "maxDiscount must be a number" })
+  .finite()
+  .positive("maxDiscount must be greater than 0")
+  .max(1_000_000, "maxDiscount is too large");
+
 export const couponKindSchema = z.enum(["fixed", "percent"], {
   error: "kind must be fixed or percent",
 });
 
-export const upsertCouponSchema = z.strictObject({
-  code: z
-    .string({ error: "code is required and must be a string" })
-    .trim()
-    .min(3, "code must be at least 3 characters")
-    .max(32, "code must be at most 32 characters")
-    .transform((v) => v.toUpperCase())
-    .refine((v) => /^[A-Z0-9_\-]+$/.test(v), {
-      message: "code may only contain A-Z, 0-9, _ and -",
-    }),
-  kind: couponKindSchema,
-  value: z
-    .number({ error: "value is required and must be a number" })
-    .finite("value must be finite")
-    .positive("value must be greater than 0")
-    .max(1_000_000, "value is too large"),
-  currency: z
-    .string({ error: "currency must be a string" })
-    .trim()
-    .max(8, "currency must be at most 8 characters")
-    .transform((v) => v.toLowerCase())
-    .optional(),
-  minBookingAmount: z
-    .number({ error: "minBookingAmount must be a number" })
-    .finite()
-    .min(0, "minBookingAmount must be >= 0")
-    .max(10_000_000, "minBookingAmount is too large")
-    .default(0),
-  maxDiscount: z
-    .number({ error: "maxDiscount must be a number" })
-    .finite()
-    .positive("maxDiscount must be greater than 0")
-    .max(1_000_000, "maxDiscount is too large")
-    .optional(),
-  startsAt: z.coerce.date({ error: "startsAt is required and must be a date" }),
-  expiresAt: z.coerce.date({ error: "expiresAt is required and must be a date" }),
-  globalLimit: z
-    .number({ error: "globalLimit must be a number" })
-    .int("globalLimit must be an integer")
-    .positive("globalLimit must be at least 1")
-    .max(1_000_000, "globalLimit is too large")
-    .optional(),
-  perCustomerLimit: z
-    .number({ error: "perCustomerLimit must be a number" })
-    .int("perCustomerLimit must be an integer")
-    .positive("perCustomerLimit must be at least 1")
-    .max(1000, "perCustomerLimit is too large")
-    .default(1),
-  categories: z
-    .array(z.string().trim().min(1).max(60))
-    .max(20, "At most 20 categories")
-    .optional(),
-  active: z.boolean({ error: "active must be a boolean" }).default(true),
-}).refine((value) => value.startsAt.getTime() < value.expiresAt.getTime(), {
-  message: "startsAt must be before expiresAt",
-  path: ["expiresAt"],
-}).refine((value) => value.kind !== "percent" || value.value <= 100, {
-  message: "percent coupons must be at most 100",
-  path: ["value"],
-}).refine((value) => value.kind !== "fixed" || (typeof value.currency === "string" && value.currency.length === 3), {
-  message: "fixed coupons require a 3-letter ISO 4217 currency",
-  path: ["currency"],
-});
+const couponFieldRules = (
+  value: {
+    kind: "fixed" | "percent";
+    value: number;
+    currency?: string;
+  },
+  ctx: z.RefinementCtx
+) => {
+  if (value.kind === "percent" && value.value > 100) {
+    ctx.addIssue({
+      code: "custom",
+      message: "percent coupons must be at most 100",
+      path: ["value"],
+    });
+  }
+  if (
+    value.kind === "fixed" &&
+    (typeof value.currency !== "string" || value.currency.length !== 3)
+  ) {
+    ctx.addIssue({
+      code: "custom",
+      message: "fixed coupons require a 3-letter ISO 4217 currency",
+      path: ["currency"],
+    });
+  }
+};
+
+export const upsertCouponSchema = z
+  .strictObject({
+    code: couponCodeFieldSchema,
+    kind: couponKindSchema,
+    value: z
+      .number({ error: "value is required and must be a number" })
+      .finite("value must be finite")
+      .positive("value must be greater than 0")
+      .max(1_000_000, "value is too large"),
+    currency: z
+      .string({ error: "currency must be a string" })
+      .trim()
+      .max(8, "currency must be at most 8 characters")
+      .transform((v) => v.toLowerCase())
+      .optional(),
+    minBookingAmount: z
+      .number({ error: "minBookingAmount must be a number" })
+      .finite()
+      .min(0, "minBookingAmount must be >= 0")
+      .max(10_000_000, "minBookingAmount is too large")
+      .default(0),
+    maxDiscount: couponMaxDiscountSchema.optional(),
+    startsAt: couponDateSchema("startsAt"),
+    expiresAt: couponDateSchema("expiresAt"),
+    globalLimit: couponGlobalLimitSchema.optional(),
+    perCustomerLimit: couponPerCustomerLimitSchema.default(1),
+    categories: z
+      .array(z.string().trim().min(1).max(60))
+      .max(20, "At most 20 categories")
+      .optional(),
+    active: z.boolean({ error: "active must be a boolean" }).default(true),
+  })
+  .superRefine((value, ctx) => {
+    if (value.startsAt.getTime() >= value.expiresAt.getTime()) {
+      ctx.addIssue({
+        code: "custom",
+        message: "startsAt must be before expiresAt",
+        path: ["expiresAt"],
+      });
+    }
+    couponFieldRules(value, ctx);
+  });
+
+export const updateCouponSchema = z
+  .strictObject({
+    active: z.boolean({ error: "active must be a boolean" }).optional(),
+    expiresAt: couponDateSchema("expiresAt").optional(),
+    perCustomerLimit: couponPerCustomerLimitSchema.optional(),
+    // null removes the existing global limit.
+    globalLimit: z
+      .union([couponGlobalLimitSchema, z.null()], {
+        error: "globalLimit must be a positive integer or null",
+      })
+      .optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (Object.keys(value).length === 0) {
+      ctx.addIssue({
+        code: "custom",
+        message: "No editable fields provided.",
+      });
+    }
+  });
 
 export type UpsertCouponData = z.infer<typeof upsertCouponSchema>;
 

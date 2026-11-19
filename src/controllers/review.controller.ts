@@ -78,12 +78,17 @@ export const getLatestReviews = async (
   const page = parsed.data.page ?? 1;
   const skip = (page - 1) * limit;
 
-  const REVIEW_EXISTS = { review: { $exists: true } } as const;
+  const ELIGIBLE_REVIEW_FILTER = {
+    review: { $exists: true },
+    "review.rating": { $type: "number", $gte: 1, $lte: 5 },
+    "review.comment": { $type: "string" },
+    "review.createdAt": { $type: "date" },
+  } as const;
 
   const [rows, totalItems] = await Promise.all([
     getBookingsCollection()
       .aggregate<LatestReviewRow>([
-        { $match: REVIEW_EXISTS },
+        { $match: ELIGIBLE_REVIEW_FILTER },
         { $sort: { "review.createdAt": -1, _id: -1 } },
         { $skip: skip },
         { $limit: limit },
@@ -100,7 +105,7 @@ export const getLatestReviews = async (
         },
       ])
       .toArray(),
-    getBookingsCollection().countDocuments(REVIEW_EXISTS),
+    getBookingsCollection().countDocuments(ELIGIBLE_REVIEW_FILTER),
   ]);
 
   const totalPages = totalItems === 0 ? 0 : Math.ceil(totalItems / limit);

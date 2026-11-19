@@ -5,6 +5,7 @@ import type { AuthenticatedRequest } from "../middleware/verifyToken.js";
 import {
   applyCouponSchema,
   upsertCouponSchema,
+  updateCouponSchema,
   couponIdParamSchema,
 } from "../validators/features.validator.js";
 import {
@@ -24,6 +25,7 @@ import {
 } from "../models/service.model.js";
 import { getPaymentsCollection } from "../models/payment.model.js";
 import { stripeCurrency } from "../config/stripe.js";
+import { isObjectIdHex } from "../utils/objectid.js";
 
 // Coupon definitions are platform configuration embedded on the single Main
 // Admin user document (`adminConfig.coupons`). They are bounded (≤200),
@@ -292,17 +294,20 @@ export const claimCouponRedemption = async (
  * successful claim. Never lets the counter go below zero.
  */
 export const releaseCouponUsageSlot = async (code: string): Promise<void> => {
-  const mainAdmin = await findMainAdmin();
-  if (!mainAdmin) return;
-  const coupons = ((mainAdmin as { adminConfig?: AdminConfig }).adminConfig?.coupons ?? []) as CouponDefinition[];
-  const updated = coupons.map((entry) =>
-    entry.code === code && entry.usageCount > 0
-      ? { ...entry, usageCount: entry.usageCount - 1 }
-      : entry
-  );
+  const normalized = normalizeCouponCode(code);
+  if (!CODE_RE.test(normalized)) return;
+
   await getUsersCollection().updateOne(
-    { _id: mainAdmin._id },
-    { $set: { "adminConfig.coupons": updated, "adminConfig.updatedAt": new Date() } }
+    {
+      isMainAdmin: true,
+      "adminConfig.coupons": {
+        $elemMatch: { code: normalized, usageCount: { $gt: 0 } },
+      },
+    },
+    {
+      $inc: { "adminConfig.coupons.$.usageCount": -1 },
+      $set: { "adminConfig.updatedAt": new Date() },
+    } as Document
   );
 };
 
@@ -330,7 +335,7 @@ export const listCoupons = async (
 };
 
 const isCallerMainAdmin = async (userId: string): Promise<boolean> => {
-  if (!ObjectId.isValid(userId)) return false;
+  if (!isObjectIdHex(userId)) return false;
   const doc = await getDB()
     .collection(USERS_COLLECTION)
     .findOne({ _id: new ObjectId(userId) }, { projection: { isMainAdmin: 1 } });
@@ -443,6 +448,19 @@ export const updateCoupon = async (
     return;
   }
 
+  const parsed = updateCouponSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    res.status(400).json({
+      success: false,
+      message: "Validation failed.",
+      errors: parsed.error.issues.map((issue) => ({
+        field: issue.path.join("."),
+        message: issue.message,
+      })),
+    });
+    return;
+  }
+
   const config = await loadAdminConfig();
   const current = config.coupons.find((entry) => entry.code === parsedCode.data);
   if (!current) {
@@ -450,38 +468,20 @@ export const updateCoupon = async (
     return;
   }
 
-  // Only allow safe edits — identity fields stay immutable to keep
-  // redemption accounting consistent. globalLimit may be set to a number or
-  // removed with explicit `null`.
-  const body = req.body ?? {};
-  const updates: Partial<CouponDefinition> = {};
-  const removeGlobalLimit = body.globalLimit === null;
-  if (typeof body.active === "boolean") updates.active = body.active;
-  if (body.expiresAt !== undefined) {
-    const date = new Date(body.expiresAt);
-    if (Number.isNaN(date.getTime())) {
-      res.status(400).json({ success: false, message: "expiresAt must be a valid date." });
+  // Only allow safe edits — identity fields stay immutable to keep redemption
+  // accounting consistent. globalLimit may be set to a number or removed with
+  // explicit `null`.
+  const updates = parsed.data;
+  if (updates.expiresAt) {
+    const startsAt = new Date(current.startsAt);
+    if (updates.expiresAt.getTime() <= startsAt.getTime()) {
+      res.status(400).json({
+        success: false,
+        message: "expiresAt must be after startsAt.",
+        errors: [{ field: "expiresAt", message: "expiresAt must be after startsAt." }],
+      });
       return;
     }
-    updates.expiresAt = date;
-  }
-  if (typeof body.perCustomerLimit === "number" && Number.isInteger(body.perCustomerLimit) && body.perCustomerLimit >= 1 && body.perCustomerLimit <= 1000) {
-    updates.perCustomerLimit = body.perCustomerLimit;
-  }
-  if (!removeGlobalLimit && typeof body.globalLimit === "number" && Number.isInteger(body.globalLimit) && body.globalLimit >= 1 && body.globalLimit <= 1_000_000) {
-    updates.globalLimit = body.globalLimit;
-  }
-
-  if (
-    !removeGlobalLimit &&
-    Object.keys(updates).length === 0 &&
-    body.globalLimit === undefined &&
-    body.active === undefined &&
-    body.expiresAt === undefined &&
-    body.perCustomerLimit === undefined
-  ) {
-    res.status(400).json({ success: false, message: "No editable fields provided." });
-    return;
   }
 
   const mainAdmin = await findMainAdmin();
@@ -495,8 +495,18 @@ export const updateCoupon = async (
     ...rest
   } = current;
   void _ignored;
-  const merged: CouponDefinition = { ...rest, ...updates };
-  if (!removeGlobalLimit && updates.globalLimit === undefined && current.globalLimit !== undefined) {
+  const merged: CouponDefinition = { ...rest };
+
+  if (updates.active !== undefined) merged.active = updates.active;
+  if (updates.expiresAt !== undefined) merged.expiresAt = updates.expiresAt;
+  if (updates.perCustomerLimit !== undefined) {
+    merged.perCustomerLimit = updates.perCustomerLimit;
+  }
+  if (updates.globalLimit === null) {
+    delete (merged as Partial<CouponDefinition>).globalLimit;
+  } else if (typeof updates.globalLimit === "number") {
+    merged.globalLimit = updates.globalLimit;
+  } else if (current.globalLimit !== undefined) {
     merged.globalLimit = current.globalLimit;
   }
 
@@ -569,7 +579,7 @@ export const previewCoupon = async (
   res: Response
 ): Promise<void> => {
   const authUser = req.user;
-  if (!authUser || !ObjectId.isValid(authUser.id)) {
+  if (!authUser || !isObjectIdHex(authUser.id)) {
     res.status(401).json({ success: false, message: "Authentication token is required." });
     return;
   }

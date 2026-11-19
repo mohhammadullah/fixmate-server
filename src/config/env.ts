@@ -35,6 +35,38 @@ const envSchema = z.object({
       "MONGODB_URI must start with mongodb:// or mongodb+srv://"
     ),
   MONGODB_DB_NAME: z.string().min(1, "MONGODB_DB_NAME is required"),
+  // Express `trust proxy` setting for correct client IP resolution behind
+  // reverse proxies (rate limiting, logging). Accepts a non-negative hop
+  // count (e.g. "1") or a comma-separated list of trusted proxy IPs/CIDR
+  // ranges. When unset, defaults to 1 hop to preserve existing deployments.
+  // Do not trust all proxies. Production must not set this to "true".
+  TRUST_PROXY: z
+    .string()
+    .optional()
+    .transform((value) => {
+      const trimmed = (value ?? "").trim();
+      if (!trimmed) return undefined;
+      if (/^\d+$/.test(trimmed)) return Number(trimmed);
+      return trimmed
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter(Boolean);
+    })
+    .pipe(
+      z
+        .union([
+          z.undefined(),
+          z.number().int().min(0).max(20),
+          z
+            .array(
+              z.string().regex(
+                /^[0-9a-zA-Z_.*:-]+(\/\d{1,3})?$/,
+                "TRUST_PROXY entries must be proxy addresses, names, or CIDR ranges"
+              )
+            )
+            .min(1),
+        ])
+    ),
   // Comma-separated reverse-proxy IPs or CIDR ranges (e.g.
   // "10.0.0.0/8,192.168.1.10"). Passed to Better Auth so it can resolve the
   // real client IP from X-Forwarded-For and key rate limits per client
@@ -155,6 +187,16 @@ const envSchema = z.object({
       message: "IMGBB_UPLOAD_URL is a test-only override and must not be set in production",
     });
   }
+
+  const rawTrustProxy = (process.env.TRUST_PROXY ?? "").trim().toLowerCase();
+  if (rawTrustProxy === "true") {
+    ctx.addIssue({
+      code: "custom",
+      path: ["TRUST_PROXY"],
+      message:
+        "TRUST_PROXY must not be 'true'. Use a hop count or explicit trusted proxy addresses/ranges.",
+    });
+  }
 });
 
 const parsed = envSchema.safeParse(process.env);
@@ -177,6 +219,10 @@ export const env = {
   CLIENT_URL: clientUrl,
   BETTER_AUTH_URL: betterAuthUrl,
   TRUSTED_PROXIES: parsed.data.TRUSTED_PROXIES ?? [],
+  // Preserve existing deployments when unset (one proxy hop). Operators can
+  // override with TRUST_PROXY to match the actual topology.
+  trustProxy:
+    parsed.data.TRUST_PROXY === undefined ? 1 : parsed.data.TRUST_PROXY,
   // True only when BOTH Stripe credentials are present. Validation above
   // guarantees they are a pair; payment endpoints use this single flag.
   paymentsConfigured: Boolean(

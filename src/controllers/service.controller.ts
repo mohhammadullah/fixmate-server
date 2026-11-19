@@ -1,6 +1,7 @@
 
 import type { Request, Response } from "express";
 import { ObjectId, type Filter, type Sort } from "mongodb";
+import { isObjectIdHex } from "../utils/objectid.js";
 import { getDB } from "../config/db.js";
 import type { AuthenticatedRequest } from "../middleware/verifyToken.js";
 import { createServiceSchema, updateServiceSchema, rejectServiceSchema, listServicesQuerySchema, listMyServicesQuerySchema, escapeRegExp, nearbyServicesQuerySchema, type ListServicesSort } from "../validators/service.validator.js";
@@ -47,7 +48,7 @@ export const createService = async (
     return;
   }
 
-  if (!ObjectId.isValid(authUser.id)) {
+  if (!isObjectIdHex(authUser.id)) {
     res.status(401).json({
       success: false,
       message: "Invalid token payload.",
@@ -154,7 +155,7 @@ interface ServiceUpdateSet
 const resolveTechnicianId = (
   req: AuthenticatedRequest
 ): ObjectId | null => {
-  if (!req.user || !ObjectId.isValid(req.user.id)) {
+  if (!req.user || !isObjectIdHex(req.user.id)) {
     return null;
   }
   return new ObjectId(req.user.id);
@@ -164,7 +165,7 @@ const resolveTechnicianId = (
 const parseServiceId = (raw: unknown): ObjectId | null => {
   const id = Array.isArray(raw) ? raw[0] : raw;
 
-  if (typeof id !== "string" || !ObjectId.isValid(id)) {
+  if (!isObjectIdHex(id)) {
     return null;
   }
 

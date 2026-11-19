@@ -1,6 +1,7 @@
 
 import type { Response } from "express";
 import { ObjectId, type Document } from "mongodb";
+import { isObjectIdHex } from "../utils/objectid.js";
 import type { AuthenticatedRequest } from "../middleware/verifyToken.js";
 import {
   getUsersCollection,
@@ -35,7 +36,7 @@ export const getMyNotifications = async (
   res: Response
 ): Promise<void> => {
   const authUser = req.user;
-  if (!authUser || !ObjectId.isValid(authUser.id)) {
+  if (!authUser || !isObjectIdHex(authUser.id)) {
     res.status(401).json({ success: false, message: "Authentication token is required." });
     return;
   }
@@ -85,7 +86,7 @@ export const getUnreadCount = async (
   res: Response
 ): Promise<void> => {
   const authUser = req.user;
-  if (!authUser || !ObjectId.isValid(authUser.id)) {
+  if (!authUser || !isObjectIdHex(authUser.id)) {
     res.status(401).json({ success: false, message: "Authentication token is required." });
     return;
   }
@@ -102,7 +103,7 @@ export const markNotificationRead = async (
   res: Response
 ): Promise<void> => {
   const authUser = req.user;
-  if (!authUser || !ObjectId.isValid(authUser.id)) {
+  if (!authUser || !isObjectIdHex(authUser.id)) {
     res.status(401).json({ success: false, message: "Authentication token is required." });
     return;
   }
@@ -145,7 +146,7 @@ export const markAllNotificationsRead = async (
   res: Response
 ): Promise<void> => {
   const authUser = req.user;
-  if (!authUser || !ObjectId.isValid(authUser.id)) {
+  if (!authUser || !isObjectIdHex(authUser.id)) {
     res.status(401).json({ success: false, message: "Authentication token is required." });
     return;
   }

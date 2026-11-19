@@ -6,6 +6,7 @@ import { ObjectId } from "mongodb";
 import { env } from "./config/env.js";
 import { getUsersCollection } from "./models/technician-application.model.js";
 import { getBookingsCollection } from "./models/booking.model.js";
+import { isObjectIdHex } from "./utils/objectid.js";
 
 /**
  * Socket.IO real-time layer (authenticated, role-aware).
@@ -74,7 +75,7 @@ const verifySocketToken = async (token: string): Promise<SocketIdentity | null> 
     ) {
       return null;
     }
-    if (!ObjectId.isValid(id)) {
+    if (!isObjectIdHex(id)) {
       return null;
     }
 

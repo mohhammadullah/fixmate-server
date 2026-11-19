@@ -56,8 +56,10 @@ export const servicesIndexes: IndexDescription[] = [
 //   on the same date + hourly slot in an ACTIVE status cannot both exist.
 //   Combined with hourly (:00-aligned) slot enforcement, it eliminates
 //   double-booking even under races — violations surface as error 11000.
-// - The coupon partial index supports per-customer redemption-limit checks
-//   (count of this customer's coupon redemptions) without collection scans.
+// - Bookings that carry an applied coupon. Supports customer-scoped booking
+//   lookups involving applied coupons without collection scans. Settled
+//   per-customer coupon redemption counting is served by the payments index
+//   `payments_customerId_1_status_1_appliedCoupon_code_1`.
 export const bookingIndexes: IndexDescription[] = [
   {
     key: { customerId: 1, serviceId: 1 },
@@ -167,6 +169,12 @@ export const paymentIndexes: IndexDescription[] = [
   {
     key: { technicianId: 1, status: 1 },
     name: "payments_technicianId_1_status_1",
+  },
+  // Supports per-customer settled coupon redemption counting.
+  {
+    key: { customerId: 1, status: 1, "appliedCoupon.code": 1 },
+    name: "payments_customerId_1_status_1_appliedCoupon_code_1",
+    partialFilterExpression: { "appliedCoupon.code": { $exists: true } },
   },
 ];
 

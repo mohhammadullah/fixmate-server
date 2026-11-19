@@ -1,6 +1,7 @@
 
 import type { Response } from "express";
 import { ObjectId, type Filter, type Sort } from "mongodb";
+import { isObjectIdHex } from "../utils/objectid.js";
 import { getDB } from "../config/db.js";
 import type { AuthenticatedRequest } from "../middleware/verifyToken.js";
 import { listBookingsQuerySchema, updateBookingStatusSchema, cancelBookingSchema, OBJECT_ID_HEX_REGEX } from "../validators/booking.validator.js";
@@ -67,7 +68,7 @@ const parseParamId = (raw: unknown): ObjectId | null => {
 const resolveAuthUserId = (
   req: AuthenticatedRequest
 ): ObjectId | null => {
-  if (!req.user || !ObjectId.isValid(req.user.id)) {
+  if (!req.user || !isObjectIdHex(req.user.id)) {
     return null;
   }
   return new ObjectId(req.user.id);
@@ -291,7 +292,7 @@ export const createBooking = async (
     return;
   }
 
-  if (!ObjectId.isValid(authUser.id)) {
+  if (!isObjectIdHex(authUser.id)) {
     res.status(401).json({
       success: false,
       message: "Invalid token payload.",

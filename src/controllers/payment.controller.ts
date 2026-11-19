@@ -1,6 +1,7 @@
 
 import type { Request, Response } from "express";
 import { ObjectId, type Filter, type Sort } from "mongodb";
+import { isObjectIdHex } from "../utils/objectid.js";
 import type Stripe from "stripe";
 import { env } from "../config/env.js";
 import {
@@ -49,7 +50,7 @@ const isDuplicateKeyError = (error: unknown): boolean =>
 const resolveAuthUserId = (
   req: AuthenticatedRequest
 ): ObjectId | null => {
-  if (!req.user || !ObjectId.isValid(req.user.id)) {
+  if (!req.user || !isObjectIdHex(req.user.id)) {
     return null;
   }
   return new ObjectId(req.user.id);
