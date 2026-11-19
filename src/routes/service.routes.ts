@@ -3,22 +3,23 @@ import { Router } from "express";
 import { verifyToken } from "../middleware/verifyToken.js";
 import { verifyTechnician } from "../middleware/verifyTechnician.js";
 import { verifyAdmin } from "../middleware/verifyAdmin.js";
-import { createService, updateService, deleteService, approveService, rejectService, listServices, listMyServices, getServiceDetails, listNearbyServices } from "../controllers/service.controller.js";
+import { createService, updateService, deleteService, approveService, rejectService, listServices, listMyServices, getMyService, getServiceDetails, listNearbyServices } from "../controllers/service.controller.js";
 import { getServiceAvailabilityPublic } from "../controllers/availability.controller.js";
 
 const router = Router();
 
 // GET / is intentionally public: only approved + available services are exposed.
 router.get("/", listServices);
-// Static /my must be registered before the dynamic /:id routes below so it
-// can never be shadowed by them.
+// Static /my routes must be registered before the dynamic /:id routes below
+// so they can never be shadowed by them.
 router.get("/my", verifyToken, verifyTechnician, listMyServices);
+router.get("/my/:id", verifyToken, verifyTechnician, getMyService);
 // Static /nearby must be registered before the dynamic /:id routes below so
 // it can never be shadowed by them.
 router.get("/nearby", listNearbyServices);
 
-// Public service details. Registered after the static /my route so the
-// dynamic /:id can never shadow it.
+// Public service details. Registered after the static routes above so the
+// dynamic /:id can never shadow them.
 router.get("/:id/availability", verifyToken, getServiceAvailabilityPublic);
 router.get("/:id", getServiceDetails);
 

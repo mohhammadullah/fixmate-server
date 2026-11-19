@@ -456,6 +456,12 @@ interface MyServiceDTO {
   updatedAt: Date;
 }
 
+// Edit-form DTO for a technician's own service. Includes editable content
+// (including description) but still excludes internal/admin/account fields.
+interface MyServiceEditDTO extends MyServiceDTO {
+  description: string;
+}
+
 const toMyServiceDTO = (service: Service): MyServiceDTO => ({
   id: service._id.toHexString(),
   title: service.title,
@@ -471,6 +477,11 @@ const toMyServiceDTO = (service: Service): MyServiceDTO => ({
   isAvailable: service.availabilityStatus === "available",
   createdAt: service.createdAt,
   updatedAt: service.updatedAt,
+});
+
+const toMyServiceEditDTO = (service: Service): MyServiceEditDTO => ({
+  ...toMyServiceDTO(service),
+  description: service.description,
 });
 
 export const listServices = async (
@@ -898,6 +909,64 @@ export const listMyServices = async (
       hasNextPage: page < totalPages,
       hasPrevPage: page > 1,
     },
+  });
+};
+
+// GET /api/services/my/:id — technician only (verifyToken -> verifyTechnician).
+// Returns one owned service with editable fields (including description) for
+// the edit form. Ownership is enforced by the {_id, technicianId} filter so a
+// technician cannot read another technician's service (404 indistinguishable).
+export const getMyService = async (
+  req: AuthenticatedRequest,
+  res: Response
+): Promise<void> => {
+  if (!req.user) {
+    res.status(401).json({
+      success: false,
+      message: "Authentication token is required.",
+    });
+    return;
+  }
+
+  const technicianId = resolveTechnicianId(req);
+
+  if (!technicianId) {
+    res.status(401).json({
+      success: false,
+      message: "Invalid token payload.",
+    });
+    return;
+  }
+
+  const { id } = req.params;
+  const serviceId = parseServiceId(id);
+
+  if (!serviceId) {
+    res.status(400).json({
+      success: false,
+      message: "Invalid service id.",
+    });
+    return;
+  }
+
+  // MongoDB errors propagate to Express 5, which forwards them to the
+  // existing errorHandler middleware.
+  const service = await getServicesCollection().findOne({
+    _id: serviceId,
+    technicianId,
+  });
+
+  if (!service) {
+    res.status(404).json({
+      success: false,
+      message: "Service not found.",
+    });
+    return;
+  }
+
+  res.status(200).json({
+    success: true,
+    data: toMyServiceEditDTO(service),
   });
 };
 
