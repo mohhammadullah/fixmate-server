@@ -109,6 +109,21 @@ The pattern is always **server-only** — no secret is ever exposed through
 - The webhook path is exempted from the general per-IP API rate limiter so
   legitimate Stripe deliveries/retries are not blocked; request size limits
   and signature verification remain in place.
+- If the endpoint is created under Stripe **Event destinations** with the
+  **thin** event payload style, the `checkout.session.*` events carry only an
+  object id — the server re-fetches the full session from the Stripe API to
+  decide the settlement, so thin payloads are supported. Classic webhook
+  endpoints receiving **snapshot** payloads are also supported and need no
+  change. Either way the signature is verified first and all settlement
+  invariants (amount, currency, booking, ownership, idempotency) are checked
+  against server-side records — never against the event payload alone.
+- After deploying, place a real test-mode checkout and confirm in the
+  Dashboard → Webhooks → recent deliveries that the endpoint answers
+  **HTTP 200**, and that the booking flips to paid. Repeated HTTP 400/500 on
+  `checkout.session.completed` means the signing secret in
+  `STRIPE_WEBHOOK_SECRET` does not match the endpoint Stripe is delivering
+  to, or the endpoint is subscribed to the wrong events — fix the Dashboard
+  or the env var; redeploying or touching frontend code will not help.
 - `stripe listen --forward-to http://localhost:5000/api/payments/webhook`
   for local development (prints a `whsec_…` you can use in `.env`).
 

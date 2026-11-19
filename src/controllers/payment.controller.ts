@@ -1020,6 +1020,11 @@ const settlePendingPayment = async (
 //      fires BEFORE the money moves. Those sessions stay pending until
 //      `checkout.session.async_payment_succeeded` carries payment_status
 //      "paid" (or async_payment_failed retires the pending record).
+//      When the event carries NO payment_status at all (a thin payload —
+//      e.g. Stripe Event Destinations configured with the thin payload
+//      style), the handler re-fetches the session from Stripe itself and
+//      reconciles against that; a payload that cannot be verified is never
+//      silently dropped, and a fetch failure answers 500 so Stripe retries.
 //   1. the session id must be one we recorded;
 //   2. the session metadata booking reference, amount and currency must
 //      match our record exactly;
@@ -1090,6 +1095,8 @@ const settleCompletedSession = async (
   const sessionId = toHexOrNull(session?.id);
 
   if (!sessionId) {
+    // Cannot reconcile an event without a session reference — nothing to act on.
+    console.error("[payments] settleCompletedSession called without a session id");
     return;
   }
 
@@ -1097,10 +1104,49 @@ const settleCompletedSession = async (
   // the time `completed` fires. Never mark anything paid on that basis —
   // acknowledge and wait for async_payment_succeeded / async_payment_failed.
   if (session.payment_status !== "paid") {
-    console.log(
-      `[payments] session ${sessionId} completed with payment_status "${session.payment_status ?? "unknown"}" — left pending until the asynchronous payment settles`
-    );
-    return;
+    if (typeof session.payment_status === "string") {
+      // Well-formed async-payment payload: the money is genuinely in
+      // flight. Keep waiting for async_payment_succeeded; nothing settles
+      // until then.
+      console.log(
+        `[payments] session ${sessionId} completed with payment_status "${session.payment_status ?? "unknown"}" — left pending until the asynchronous payment settles`
+      );
+      return;
+    }
+
+    // Thin payload (e.g. a Stripe Event Destination configured with the
+    // thin payload style): no payment_status is present, so this handler
+    // cannot decide from the payload alone. Re-fetch the session from
+    // Stripe — the only authority that knows whether the money moved — and
+    // reconcile against that. The webhook signature was already verified,
+    // and every invariant below is re-checked against our own records.
+    // A session id that can never become valid will only produce an
+    // infinite retry loop — log and acknowledge instead of retrying.
+    if (!/^cs_(test|live)_[A-Za-z0-9_]+$/.test(sessionId)) {
+      console.error(`[payments] thin payload carried a malformed session id "${sessionId}" — acknowledged and ignored`);
+      return;
+    }
+    const stripe = getStripeClient();
+    if (!stripe) {
+      throw new Error("Stripe client is unavailable for webhook reconciliation");
+    }
+    try {
+      session = await stripe.checkout.sessions.retrieve(sessionId);
+    } catch (error) {
+      // Never silently drop a possibly-paid session: surface the failure
+      // so the webhook answers 500 and Stripe retries.
+      console.error(
+        `[payments] unable to retrieve thin payload session ${sessionId}:`,
+        error instanceof Error ? error.message : "unknown error"
+      );
+      throw new Error("Thin webhook payload could not be reconciled");
+    }
+    if (session.payment_status !== "paid") {
+      console.log(
+        `[payments] session ${sessionId} retrieved; payment_status "${session.payment_status ?? "unknown"}" — left pending until the money settles`
+      );
+      return;
+    }
   }
 
   const payment = await getPaymentsCollection().findOne({
@@ -1239,11 +1285,12 @@ const settleCompletedSession = async (
 // events: checkout.session.completed, checkout.session.async_payment_succeeded,
 // checkout.session.async_payment_failed, checkout.session.expired. A
 // `completed` (or `async_payment_succeeded`) session only settles the
-// payment when Stripe reports payment_status "paid". Always answers 200 for
-// handled (and uninteresting) events; 400 only for a missing signature or
-// raw-body misconfiguration, and 503 when the webhook secret is not
-// configured. Processing failures answer 500 so Stripe retries — the
-// handler is idempotent.
+// payment when Stripe reports payment_status "paid"; a thin payload without
+// payment_status is re-fetched from Stripe before any decision is made.
+// Always answers 200 for handled (and uninteresting) events; 400 only for a
+// missing signature or raw-body misconfiguration, and 503 when the webhook
+// secret is not configured. Processing failures answer 500 so Stripe retries
+// — the handler is idempotent.
 export const handleStripeWebhook = async (
   req: Request,
   res: Response
